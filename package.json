@@ -1,0 +1,22 @@
+{
+  "name": "@hexafield/solid-link-language",
+  "version": "0.1.0",
+  "description": "Solid Link Language for AD4M — bridges Perspectives to Solid Pods via LDP",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "build": "deno run --allow-all esbuild.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-vm-modules --import tsx --test tests/*.test.ts"
+  },
+  "author": "HexaField",
+  "license": "CAL-1.0",
+  "dependencies": {
+    "@coasys/ad4m-ldk": "link:../ad4m/ad4m-ldk/js"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsx": "^4.16.0",
+    "@types/node": "^20.0.0"
+  }
+}
