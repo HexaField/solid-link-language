@@ -29,13 +29,13 @@ import { linkToTurtle, linkBatchToTurtle, turtleToLinks, linkContentKey, buildIn
 import { shouldPublishToSolid, linkOriginKey, isExcludedPredicate, linkContentHash } from "./src/dual-language.js";
 import * as store from "./src/store.js";
 import { syncFromPod, fullSync } from "./src/sync.js";
-import { ldpPut, ldpPatch, ldpDelete } from "./src/ldp.js";
+import { ldpPut, ldpPatch, ldpDelete, ldpHead, ldpGet, resourceExists } from "./src/ldp.js";
 import { linksContainerUrl, linkResourceUrl, metaResourceUrl } from "./src/ldp.pure.js";
 import { getAuthToken, buildAuthHeaders, isAuthenticated } from "./src/auth.js";
 import { setContainerAcl, updateMembersRegistry } from "./src/acl.js";
 
 // Adapter imports (interfaces for singletons, Deno impls for init)
-import { initTransport } from "./src/transport.js";
+import { initTransport, getTransport } from "./src/transport.js";
 import { DenoTransport } from "./src/transport-deno.js";
 import { initStorage, getStorage } from "./src/storage-interface.js";
 import { DenoStorageAdapter } from "./src/storage-deno.js";
@@ -79,6 +79,62 @@ function authToken(): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Container initialization
+// ---------------------------------------------------------------------------
+
+let containerInitialized = false;
+
+/**
+ * Ensure the LDP container exists, creating it if necessary.
+ * CSS creates containers when you PUT with the right Link header for LDP BasicContainer.
+ */
+async function ensureContainerExists(): Promise<void> {
+    if (containerInitialized) return;
+
+    const cUrl = containerUrl();
+    const token = authToken();
+
+    // Check if container already exists
+    const exists = await resourceExists(cUrl, token || undefined);
+    if (exists) {
+        containerInitialized = true;
+        return;
+    }
+
+    // Create the parent container first
+    const parentUrl = `${SOLID_POD_URL.replace(/\/$/, "")}${SOLID_CONTAINER_PATH.replace(/\/$/, "")}/`;
+    const parentExists = await resourceExists(parentUrl, token || undefined);
+    if (!parentExists) {
+        console.log(`[solid-link-language] creating parent container: ${parentUrl}`);
+        const parentHeaders: Record<string, string> = {
+            "Content-Type": "text/turtle",
+            "Link": '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"',
+        };
+        if (token) parentHeaders["Authorization"] = `Bearer ${token}`;
+        const parentBody = `@prefix dcterms: <http://purl.org/dc/terms/> .\n\n<> dcterms:title "AD4M Container" .\n`;
+        const parentResp = await getTransport().fetch(parentUrl, "PUT", parentHeaders, parentBody);
+        console.log(`[solid-link-language] parent container PUT: ${parentResp.status}`);
+    }
+
+    // Create the links/ container
+    console.log(`[solid-link-language] creating links container: ${cUrl}`);
+    const linksHeaders: Record<string, string> = {
+        "Content-Type": "text/turtle",
+        "Link": '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"',
+    };
+    if (token) linksHeaders["Authorization"] = `Bearer ${token}`;
+    const linksBody = `@prefix dcterms: <http://purl.org/dc/terms/> .\n\n<> dcterms:title "AD4M Links" .\n`;
+    const linksResp = await getTransport().fetch(cUrl, "PUT", linksHeaders, linksBody);
+    console.log(`[solid-link-language] links container PUT: ${linksResp.status}`);
+
+    if (linksResp.status >= 200 && linksResp.status < 300) {
+        containerInitialized = true;
+    } else {
+        console.error(`[solid-link-language] failed to create container: ${linksResp.status} ${linksResp.body}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Language definition
 // ---------------------------------------------------------------------------
 
@@ -105,6 +161,15 @@ const language = defineLanguage({
         console.log(`[solid-link-language] sync mode: ${settings.syncMode}`);
         console.log(`[solid-link-language] membership: ${settings.membership}`);
         console.log(`[solid-link-language] rendering: ${settings.rendering.strategy}`);
+
+        // Ensure container exists on init
+        if (SOLID_POD_URL !== "<to-be-filled>" && SOLID_CONTAINER_PATH !== "<to-be-filled>") {
+            try {
+                await ensureContainerExists();
+            } catch (err) {
+                console.error(`[solid-link-language] failed to ensure container: ${err}`);
+            }
+        }
     },
 
     async teardown() {
@@ -133,6 +198,9 @@ const language = defineLanguage({
             const token = authToken();
             const hashFn = getRuntime().hash;
             const storage = getStorage();
+
+            // Ensure container exists before writing
+            await ensureContainerExists();
 
             // 3. Track origins for new native commits
             for (const link of diff.additions) {
