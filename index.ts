@@ -26,23 +26,17 @@ import type { PerspectiveDiff, LinkExpression } from "./src/types.js";
 import { parseSettings } from "./src/settings.js";
 import type { SolidSettings } from "./src/settings.js";
 import { linkToTurtle, linkBatchToTurtle, turtleToLinks, linkContentKey, buildInsertPatch, buildDeletePatch } from "./src/translate.js";
-import { shouldPublishToSolid, linkOriginKey, isExcludedPredicate, linkContentHash } from "./src/dual-language.js";
+import { shouldPublishToSolid, linkOriginKey, isExcludedPredicate, linkContentHash } from "./src/translate.js";
 import * as store from "./src/store.js";
 import { syncFromPod, fullSync } from "./src/sync.js";
 import { ldpPut, ldpPatch, ldpDelete, ldpHead, ldpGet, resourceExists } from "./src/ldp.js";
-import { linksContainerUrl, linkResourceUrl, metaResourceUrl } from "./src/ldp.pure.js";
+import { linksContainerUrl, linkResourceUrl, metaResourceUrl } from "./src/ldp.js";
 import { getAuthToken, buildAuthHeaders, isAuthenticated } from "./src/auth.js";
 import { setContainerAcl, updateMembersRegistry } from "./src/acl.js";
 
-// Adapter imports (interfaces for singletons, Deno impls for init)
-import { initTransport, getTransport } from "./src/transport.js";
-import { DenoTransport } from "./src/transport-deno.js";
-import { initStorage, getStorage } from "./src/storage-interface.js";
-import { DenoStorageAdapter } from "./src/storage-deno.js";
-import { initSigning } from "./src/signing-interface.js";
-import { DenoSigningAdapter } from "./src/signing-deno.js";
-import { initRuntime, getRuntime } from "./src/runtime-interface.js";
-import { DenoRuntime } from "./src/runtime-deno.js";
+// Adapter imports
+import { initTransport, getTransport, initStorage, getStorage, initSigning, initRuntime, getRuntime } from "./src/adapters.js";
+import { DenoTransport, DenoStorageAdapter, DenoSigningAdapter, DenoRuntime } from "./src/adapters-deno.js";
 
 // ---------------------------------------------------------------------------
 // Template Variables (per Spec §9)

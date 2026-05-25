@@ -13,8 +13,8 @@ import {
     linkToRawTriple,
     graphToLinks,
     linkContentKey,
-} from "../src/translate.pure.js";
-import { triplesToTurtle, parseTurtle } from "../src/rdf.pure.js";
+} from "../src/translate.js";
+import { triplesToTurtle, parseTurtle } from "../src/rdf.js";
 import type { LinkExpression } from "../src/types.js";
 import { AD4M_NS, RDF_NS, XSD_NS, DEFAULT_PREFIXES } from "../src/ontology.js";
 

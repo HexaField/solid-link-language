@@ -12,21 +12,21 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 // Adapter interfaces
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage, getStorage } from "../src/storage-interface.js";
-import type { Transport, TransportResponse } from "../src/transport.js";
-import { initTransport } from "../src/transport.js";
-import type { SigningAdapter } from "../src/signing-interface.js";
-import { initSigning } from "../src/signing-interface.js";
-import type { RuntimeAdapter } from "../src/runtime-interface.js";
-import { initRuntime } from "../src/runtime-interface.js";
+import type { StorageAdapter } from "../src/adapters.js";
+import { initStorage, getStorage } from "../src/adapters.js";
+import type { Transport, TransportResponse } from "../src/adapters.js";
+import { initTransport } from "../src/adapters.js";
+import type { SigningAdapter } from "../src/adapters.js";
+import { initSigning } from "../src/adapters.js";
+import type { RuntimeAdapter } from "../src/adapters.js";
+import { initRuntime } from "../src/adapters.js";
 
 // Production modules under test
 import * as store from "../src/store.js";
 import type { LinkExpression, PerspectiveDiff } from "../src/types.js";
-import { linkToReifiedTriples, graphToLinks, linkContentKey } from "../src/translate.pure.js";
-import { triplesToTurtle, parseTurtle } from "../src/rdf.pure.js";
-import { shouldPublishToSolid, linkOriginKey, linkContentHash } from "../src/dual-language.js";
+import { linkToReifiedTriples, graphToLinks, linkContentKey } from "../src/translate.js";
+import { triplesToTurtle, parseTurtle } from "../src/rdf.js";
+import { shouldPublishToSolid, linkOriginKey, linkContentHash } from "../src/translate.js";
 import { DEFAULT_SETTINGS } from "../src/settings.js";
 import { generateAcl, generateMembersRegistry } from "../src/acl.js";
 import { AD4M_NS, RDF_NS } from "../src/ontology.js";

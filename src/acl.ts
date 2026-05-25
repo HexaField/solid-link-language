@@ -9,7 +9,7 @@
 
 import type { MembershipMode } from "./settings.js";
 import { ldpPut } from "./ldp.js";
-import { aclResourceUrl, membersResourceUrl } from "./ldp.pure.js";
+import { aclResourceUrl, membersResourceUrl } from "./ldp.js";
 import { ACL_NS, FOAF_NS, VCARD_NS } from "./ontology.js";
 
 // ---------------------------------------------------------------------------

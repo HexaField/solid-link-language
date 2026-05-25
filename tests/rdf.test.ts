@@ -18,8 +18,8 @@ import {
     getObject,
     getObjects,
     getTriplesBySubject,
-} from "../src/rdf.pure.js";
-import type { RdfTriple } from "../src/rdf.pure.js";
+} from "../src/rdf.js";
+import type { RdfTriple } from "../src/rdf.js";
 import { AD4M_NS, RDF_NS, XSD_NS, LDP_NS } from "../src/ontology.js";
 
 // ---------------------------------------------------------------------------

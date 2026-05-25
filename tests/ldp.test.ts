@@ -21,7 +21,7 @@ import {
     extractContainedResources,
     TURTLE_CONTENT_TYPE,
     N3_CONTENT_TYPE,
-} from "../src/ldp.pure.js";
+} from "../src/ldp.js";
 
 // ---------------------------------------------------------------------------
 // Header builders

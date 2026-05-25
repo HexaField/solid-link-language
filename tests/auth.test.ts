@@ -14,13 +14,13 @@ import {
     stripQueryFragment,
     base64url,
     generateJti,
-} from "../src/auth.pure.js";
-import type { JsonWebKey } from "../src/auth.pure.js";
+} from "../src/auth.js";
+import type { JsonWebKey } from "../src/auth.js";
 
-import type { StorageAdapter } from "../src/storage-interface.js";
-import { initStorage } from "../src/storage-interface.js";
-import type { SigningAdapter } from "../src/signing-interface.js";
-import { initSigning } from "../src/signing-interface.js";
+import type { StorageAdapter } from "../src/adapters.js";
+import { initStorage } from "../src/adapters.js";
+import type { SigningAdapter } from "../src/adapters.js";
+import { initSigning } from "../src/adapters.js";
 
 import {
     getAuthToken,

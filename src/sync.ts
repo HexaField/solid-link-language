@@ -12,12 +12,12 @@
 
 import type { PerspectiveDiff, LinkExpression } from "./types.js";
 import type { SolidSettings } from "./settings.js";
-import { getStorage } from "./storage-interface.js";
+import { getStorage } from "./adapters.js";
 import { ldpGet, fetchTurtle, conditionalGet } from "./ldp.js";
-import { parseTurtle, getObjects } from "./rdf.pure.js";
-import { graphToLinks } from "./translate.pure.js";
+import { parseTurtle, getObjects } from "./rdf.js";
+import { graphToLinks } from "./translate.js";
 import { ldp } from "./ontology.js";
-import { linksContainerUrl, extractLinkHash, extractContainedResources } from "./ldp.pure.js";
+import { linksContainerUrl, extractLinkHash, extractContainedResources } from "./ldp.js";
 import * as store from "./store.js";
 
 // ---------------------------------------------------------------------------
