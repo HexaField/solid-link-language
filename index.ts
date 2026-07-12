@@ -1,15 +1,20 @@
 /**
  * # Solid Link Language for AD4M
  *
- * Bridge language that syncs Perspectives via Solid Pods using
- * the Linked Data Platform (LDP) protocol.
+ * Bridge language that gives a Perspective genuine perspective-sync
+ * convergence on top of Solid Pods (Linked Data Platform).
  *
  * Implements perspective-commit, perspective-sync, perspective-query,
  * and peers capabilities.
  *
- * Links are stored as reified RDF triples in Turtle format on Solid
- * Pods, with full AD4M provenance metadata. Sync uses container
- * polling with ETag-based change detection.
+ * Solid/LDP has no native causal history, so this language emulates a
+ * content-addressed diff-DAG in the pod: each commit is an immutable
+ * resource named by its content hash, carrying ad4m:previous pointers to
+ * its parent commit(s). Folding that DAG (an OR-Set keyed by link content
+ * hash, with removals as tombstones) is the source of truth; the RDF link
+ * view is a derived projection. Sync walks the ad4m:previous chain rather
+ * than snapshot-diffing the container, and currentRevision is derived from
+ * the DAG head set (never the container ETag).
  *
  * Spec: solid-link-language.md
  */
@@ -17,7 +22,6 @@
 import {
     defineLanguage,
     agentDid,
-    hash,
     languageSettings,
     emitPerspectiveDiff,
 } from "@coasys/ad4m-ldk";
@@ -25,17 +29,15 @@ import {
 import type { PerspectiveDiff, LinkExpression } from "./src/types.js";
 import { parseSettings } from "./src/settings.js";
 import type { SolidSettings } from "./src/settings.js";
-import { linkToTurtle, linkBatchToTurtle, turtleToLinks, linkContentKey, buildInsertPatch, buildDeletePatch } from "./src/translate.js";
-import { shouldPublishToSolid, linkOriginKey, isExcludedPredicate, linkContentHash } from "./src/translate.js";
 import * as store from "./src/store.js";
+import { buildCommit, commitToTurtle } from "./src/diffdag.js";
 import { syncFromPod, fullSync } from "./src/sync.js";
-import { ldpPut, ldpPatch, ldpDelete, ldpHead, ldpGet, resourceExists } from "./src/ldp.js";
-import { linksContainerUrl, linkResourceUrl, metaResourceUrl } from "./src/ldp.js";
-import { getAuthToken, buildAuthHeaders, isAuthenticated } from "./src/auth.js";
-import { setContainerAcl, updateMembersRegistry } from "./src/acl.js";
+import { ldpPut, ldpHead, ldpGet, resourceExists } from "./src/ldp.js";
+import { diffsContainerUrl, diffResourceUrl } from "./src/ldp.js";
+import { getAuthToken } from "./src/auth.js";
 
 // Adapter imports
-import { initTransport, getTransport, initStorage, getStorage, initSigning, initRuntime, getRuntime } from "./src/adapters.js";
+import { initTransport, getTransport, initStorage, initSigning, initRuntime } from "./src/adapters.js";
 import { DenoTransport, DenoStorageAdapter, DenoSigningAdapter, DenoRuntime } from "./src/adapters-deno.js";
 
 // ---------------------------------------------------------------------------
@@ -64,8 +66,9 @@ const NEIGHBOURHOOD_META = "<to-be-filled>";
 let myDid: string = "";
 let settings: SolidSettings;
 
-function containerUrl(): string {
-    return linksContainerUrl(SOLID_POD_URL, SOLID_CONTAINER_PATH);
+/** The pod container holding the immutable diff-commit DAG resources. */
+function diffsContainer(): string {
+    return diffsContainerUrl(SOLID_POD_URL, SOLID_CONTAINER_PATH);
 }
 
 function authToken(): string | null {
@@ -85,46 +88,45 @@ let containerInitialized = false;
 async function ensureContainerExists(): Promise<void> {
     if (containerInitialized) return;
 
-    const cUrl = containerUrl();
+    const cUrl = diffsContainer();
     const token = authToken();
 
-    // Check if container already exists
+    // Check if the diffs/ container already exists.
     const exists = await resourceExists(cUrl, token || undefined);
     if (exists) {
         containerInitialized = true;
         return;
     }
 
-    // Create the parent container first
+    const containerHeaders = (): Record<string, string> => {
+        const h: Record<string, string> = {
+            "Content-Type": "text/turtle",
+            "Link": '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"',
+        };
+        if (token) h["Authorization"] = `Bearer ${token}`;
+        return h;
+    };
+
+    // Create the parent container first.
     const parentUrl = `${SOLID_POD_URL.replace(/\/$/, "")}${SOLID_CONTAINER_PATH.replace(/\/$/, "")}/`;
     const parentExists = await resourceExists(parentUrl, token || undefined);
     if (!parentExists) {
         console.log(`[solid-link-language] creating parent container: ${parentUrl}`);
-        const parentHeaders: Record<string, string> = {
-            "Content-Type": "text/turtle",
-            "Link": '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"',
-        };
-        if (token) parentHeaders["Authorization"] = `Bearer ${token}`;
         const parentBody = `@prefix dcterms: <http://purl.org/dc/terms/> .\n\n<> dcterms:title "AD4M Container" .\n`;
-        const parentResp = await getTransport().fetch(parentUrl, "PUT", parentHeaders, parentBody);
+        const parentResp = await ldpPut(parentUrl, parentBody, "text/turtle", token || undefined);
         console.log(`[solid-link-language] parent container PUT: ${parentResp.status}`);
     }
 
-    // Create the links/ container
-    console.log(`[solid-link-language] creating links container: ${cUrl}`);
-    const linksHeaders: Record<string, string> = {
-        "Content-Type": "text/turtle",
-        "Link": '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"',
-    };
-    if (token) linksHeaders["Authorization"] = `Bearer ${token}`;
-    const linksBody = `@prefix dcterms: <http://purl.org/dc/terms/> .\n\n<> dcterms:title "AD4M Links" .\n`;
-    const linksResp = await getTransport().fetch(cUrl, "PUT", linksHeaders, linksBody);
-    console.log(`[solid-link-language] links container PUT: ${linksResp.status}`);
+    // Create the diffs/ container (holds the immutable diff-commit DAG).
+    console.log(`[solid-link-language] creating diffs container: ${cUrl}`);
+    const diffsBody = `@prefix dcterms: <http://purl.org/dc/terms/> .\n\n<> dcterms:title "AD4M Diff-DAG" .\n`;
+    const diffsResp = await getTransport().fetch(cUrl, "PUT", containerHeaders(), diffsBody);
+    console.log(`[solid-link-language] diffs container PUT: ${diffsResp.status}`);
 
-    if (linksResp.status >= 200 && linksResp.status < 300) {
+    if (diffsResp.status >= 200 && diffsResp.status < 300) {
         containerInitialized = true;
     } else {
-        console.error(`[solid-link-language] failed to create container: ${linksResp.status} ${linksResp.body}`);
+        console.error(`[solid-link-language] failed to create container: ${diffsResp.status} ${diffsResp.body}`);
     }
 }
 
@@ -176,65 +178,50 @@ const language = defineLanguage({
     },
 
     // -----------------------------------------------------------------------
-    // perspective-commit
+    // perspective-commit — append an immutable diff-commit to the DAG
     // -----------------------------------------------------------------------
     commit: {
         async commit(diff: PerspectiveDiff) {
-            // 1. Store links locally
-            store.applyDiff(diff);
+            const hashFn = store.getHashFn();
 
-            // 2. Skip outbound in subscribe-only mode
+            // 1. Build a diff-commit whose parents are the current DAG heads.
+            //    Removals become tombstones carrying the ORIGINAL link hash, so
+            //    they converge against the original add on every replica.
+            const parents = store.getHeads();
+            const commit = buildCommit(
+                diff,
+                parents,
+                myDid,
+                new Date().toISOString(),
+                hashFn,
+            );
+            const commitHash = store.hashCommit(commit);
+
+            // 2. Ingest into the local DAG (source of truth) and rebuild the
+            //    derived link cache by folding. currentRevision now follows the
+            //    new head automatically.
+            store.addCommitToDag(commitHash, commit);
+            store.rebuildLinksFromDag();
+
+            // 3. Emit for local subscribers regardless of sync direction.
+            emitPerspectiveDiff(diff);
             if (settings.syncMode === "subscribe-only") {
-                emitPerspectiveDiff(diff);
-                return "";
+                return commitHash;
             }
 
+            // 4. Publish the immutable diff-commit resource to the pod. It is
+            //    named by its content hash and carries ad4m:previous pointers,
+            //    forming the content-hash DAG in the pod. We never PUT/DELETE
+            //    per-link resources — the DAG is append-only, so history and
+            //    concurrent removals survive.
             const token = authToken();
-            const hashFn = getRuntime().hash;
-            const storage = getStorage();
-
-            // Ensure container exists before writing
             await ensureContainerExists();
 
-            // 3. Track origins for new native commits
-            for (const link of diff.additions) {
-                const h = store.hashLink(link);
-                const originKey = linkOriginKey(h);
-                const existing = storage.get(originKey);
-                if (existing === "solid") {
-                    storage.put(originKey, "dual");
-                } else if (!existing) {
-                    storage.put(originKey, "native");
-                }
-            }
+            const turtle = commitToTurtle(commit, hashFn);
+            const resourceUrl = diffResourceUrl(diffsContainer(), commitHash);
+            await ldpPut(resourceUrl, turtle, "text/turtle", token || undefined);
 
-            // 4. Write additions to Pod
-            for (const link of diff.additions) {
-                const h = store.hashLink(link);
-
-                // Dual-language filter
-                if (settings.dualLanguage.enabled) {
-                    if (!shouldPublishToSolid(h, (key) => storage.get(key))) continue;
-                    if (isExcludedPredicate(link.data.predicate || "", settings.dualLanguage.excludePredicates)) continue;
-                }
-
-                // Create individual link resource
-                const turtle = linkToTurtle(link, settings);
-                const resourceUrl = linkResourceUrl(containerUrl(), h);
-                await ldpPut(resourceUrl, turtle, "text/turtle", token || undefined);
-            }
-
-            // 5. Delete removed links from Pod
-            for (const link of diff.removals) {
-                const h = store.hashLink(link);
-                const resourceUrl = linkResourceUrl(containerUrl(), h);
-                await ldpDelete(resourceUrl, token || undefined);
-            }
-
-            // 6. Emit the perspective diff for local subscribers
-            emitPerspectiveDiff(diff);
-
-            return "";
+            return commitHash;
         },
     },
 
@@ -257,8 +244,9 @@ const language = defineLanguage({
             return store.allLinks();
         },
 
-        async currentRevision() {
-            return store.getRevision() || "";
+        async currentRevision(): Promise<string | null> {
+            // Content hash of the DAG head(s). Null when the DAG is empty.
+            return store.getRevision();
         },
     },
 

@@ -1,35 +1,116 @@
 /**
- * Pod sync — polling resource container for changes.
+ * Pod sync — walks the emulated diff-DAG (Role A), not a container snapshot.
  *
- * Implements the sync flow from Spec §6:
- * - Poll links container with ETag-based change detection
- * - Fetch new/modified resources
- * - Parse RDF → translate to links
- * - Store ETag in KV
+ * Solid/LDP has no native causal DAG, so this language emulates one with
+ * immutable, content-hash-named diff-commit resources (`diffs/diff-<hash>.ttl`)
+ * whose bodies carry `ad4m:previous` parent pointers. Sync is a DAG walk:
+ *
+ *   1. Discover the commit hashes present in the pod's `diffs/` container.
+ *      (This discovers WHICH COMMITS EXIST — it is not a link snapshot, and the
+ *      container ETag is never used as a revision.)
+ *   2. For any commit not already in the local DAG cache, fetch its resource,
+ *      parse it, ingest it, then follow its `ad4m:previous` pointers, fetching
+ *      any missing ancestors transitively. This converges the local DAG with
+ *      the pod's, re-requesting missing parents just like the Holochain
+ *      reference's `pull` walks ancestry.
+ *   3. Recompute heads and fold the whole reachable DAG with OR-Set semantics.
+ *      Emit the PerspectiveDiff between the pre-sync fold and the post-sync
+ *      fold, so AD4M sees exactly the links that appeared/disappeared —
+ *      including first-class removals carrying the original link.
  *
  * No ad4m:host imports — uses injected adapters only.
  */
 
-import type { PerspectiveDiff, LinkExpression } from "./types.js";
-import type { SolidSettings } from "./settings.js";
+import type { PerspectiveDiff } from "./types.js";
 import { getStorage } from "./adapters.js";
-import { ldpGet, fetchTurtle, conditionalGet } from "./ldp.js";
+import { fetchTurtle } from "./ldp.js";
 import { parseTurtle, getObjects } from "./rdf.js";
-import { graphToLinks } from "./translate.js";
 import { ldp } from "./ontology.js";
-import { linksContainerUrl, extractLinkHash, extractContainedResources } from "./ldp.js";
+import {
+    linksContainerUrl,
+    diffsContainerUrl,
+    diffResourceUrl,
+    extractCommitHash,
+    extractContainedResources,
+} from "./ldp.js";
 import * as store from "./store.js";
+import { commitFromGraph, foldCommits, diffBetweenFolds } from "./diffdag.js";
 
 // ---------------------------------------------------------------------------
-// KV Keys
+// Container discovery
 // ---------------------------------------------------------------------------
 
-const SYNC_ETAG_KEY = "solid:sync:etag";
-const RESOURCE_ETAG_PREFIX = "solid:etag:";
-const KNOWN_RESOURCES_KEY = "solid:sync:known-resources";
+/**
+ * List the commit hashes present in the pod's `diffs/` container. Parses the
+ * LDP container listing purely to discover which diff resources exist; the
+ * bodies (and their causal structure) are fetched and folded separately.
+ */
+async function discoverPodCommitHashes(
+    diffsContainer: string,
+    authToken?: string,
+): Promise<string[]> {
+    const body = await fetchTurtle(diffsContainer, authToken);
+    if (!body) return [];
 
-function resourceEtagKey(url: string): string {
-    return `${RESOURCE_ETAG_PREFIX}${url}`;
+    const graph = parseTurtle(body, diffsContainer);
+    const contained = getObjects(graph, diffsContainer, ldp.contains);
+    const urls = extractContainedResources(diffsContainer, contained);
+
+    const hashes: string[] = [];
+    for (const url of urls) {
+        const h = extractCommitHash(url);
+        if (h) hashes.push(h);
+    }
+    return hashes;
+}
+
+// ---------------------------------------------------------------------------
+// Ancestor walk
+// ---------------------------------------------------------------------------
+
+/**
+ * Ensure `hash` and all its ancestors are present in the local DAG cache,
+ * fetching any that are missing from the pod. Follows `ad4m:previous` pointers
+ * transitively. Cycles / already-present commits terminate the walk.
+ *
+ * @returns the set of commit hashes newly fetched during this walk.
+ */
+export async function fetchCommitWithAncestors(
+    diffsContainer: string,
+    hash: string,
+    authToken: string | undefined,
+    fetched: Set<string> = new Set(),
+): Promise<Set<string>> {
+    const stack = [hash];
+
+    while (stack.length > 0) {
+        const current = stack.pop()!;
+        if (fetched.has(current)) continue;
+        if (store.hasCommit(current)) continue;
+
+        const url = diffResourceUrl(diffsContainer, current);
+        const turtle = await fetchTurtle(url, authToken);
+        if (!turtle) {
+            // Missing on the pod — cannot fetch. Leave as a dangling parent
+            // pointer; the fold simply lacks that commit's diff.
+            continue;
+        }
+
+        const commit = commitFromGraph(parseTurtle(turtle, url), url);
+        if (!commit) continue;
+
+        store.putCommit(current, commit);
+        fetched.add(current);
+
+        // Walk parents that we don't yet have.
+        for (const parent of commit.previous) {
+            if (!store.hasCommit(parent) && !fetched.has(parent)) {
+                stack.push(parent);
+            }
+        }
+    }
+
+    return fetched;
 }
 
 // ---------------------------------------------------------------------------
@@ -37,136 +118,68 @@ function resourceEtagKey(url: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Perform a full sync cycle: poll the links container, detect changes,
- * fetch new/modified resources, translate to links, apply to store.
+ * Perform a full sync cycle by walking the pod's diff-DAG and folding it.
  *
  * @param podUrl Pod base URL
  * @param containerPath Container path on the Pod
  * @param authToken Optional auth token
- * @returns PerspectiveDiff of changes found
+ * @returns PerspectiveDiff of links that appeared/disappeared vs. the pre-sync
+ *   materialised state.
  */
 export async function syncFromPod(
     podUrl: string,
     containerPath: string,
     authToken?: string,
 ): Promise<PerspectiveDiff> {
-    const containerUrl = linksContainerUrl(podUrl, containerPath);
-    const storage = getStorage();
+    const diffsContainer = diffsContainerUrl(podUrl, containerPath);
+    const hashFn = store.getHashFn();
 
-    // Check container for changes using ETag
-    const currentEtag = storage.get(SYNC_ETAG_KEY);
-    const containerResponse = currentEtag
-        ? await conditionalGet(containerUrl, currentEtag, authToken)
-        : await ldpGet(containerUrl, "text/turtle", undefined, authToken)
-            .then(r => ({
-                changed: r.status >= 200 && r.status < 300,
-                body: r.status >= 200 && r.status < 300 ? r.body : null,
-                newEtag: r.headers["etag"] || r.headers["ETag"] || null,
-            }));
+    // Snapshot the pre-sync fold so we can emit an incremental diff.
+    const before = foldCommits(store.loadDag(), hashFn);
 
-    if (!containerResponse.changed || !containerResponse.body) {
+    // 1. Discover which commits the pod has.
+    const podHashes = await discoverPodCommitHashes(diffsContainer, authToken);
+
+    // 2. Fetch every commit we're missing, plus all their ancestors.
+    const fetched = new Set<string>();
+    for (const h of podHashes) {
+        if (!store.hasCommit(h)) {
+            await fetchCommitWithAncestors(diffsContainer, h, authToken, fetched);
+        }
+    }
+
+    if (fetched.size === 0) {
+        // Nothing new — DAG (and therefore revision) unchanged.
         return { additions: [], removals: [] };
     }
 
-    // Update container ETag
-    if (containerResponse.newEtag) {
-        storage.put(SYNC_ETAG_KEY, containerResponse.newEtag);
-    }
+    // 3. Recompute heads from the converged DAG and fold it.
+    store.recomputeHeads();
+    const dag = store.loadDag();
+    const after = foldCommits(dag, hashFn);
 
-    // Parse container listing
-    const containerGraph = parseTurtle(containerResponse.body, containerUrl);
-    const containedUris = getObjects(containerGraph, containerUrl, ldp.contains);
-    const resourceUrls = extractContainedResources(containerUrl, containedUris);
+    // Rebuild the derived query/render cache to match the authoritative fold.
+    store.rebuildLinksFromDag();
 
-    // Determine known vs new resources
-    const knownRaw = storage.get(KNOWN_RESOURCES_KEY);
-    const knownResources = new Set<string>(knownRaw ? JSON.parse(knownRaw) : []);
-
-    const newResources = resourceUrls.filter(url => !knownResources.has(url));
-    const removedResources = [...knownResources].filter(url => !resourceUrls.includes(url));
-
-    // Fetch new resources and extract links
-    const additions: LinkExpression[] = [];
-    for (const resourceUrl of newResources) {
-        const turtle = await fetchTurtle(resourceUrl, authToken);
-        if (turtle) {
-            const links = graphToLinks(parseTurtle(turtle, resourceUrl), resourceUrl);
-            additions.push(...links);
-            for (const link of links) {
-                store.putLink(link);
-            }
-        }
-    }
-
-    // Handle removed resources — find links that were in those resources
-    const removals: LinkExpression[] = [];
-    for (const resourceUrl of removedResources) {
-        const linkHash = extractLinkHash(resourceUrl);
-        if (linkHash) {
-            const existingLink = store.getLink(linkHash);
-            if (existingLink) {
-                removals.push(existingLink);
-                store.removeLink(existingLink);
-            }
-        }
-    }
-
-    // Update known resources
-    storage.put(KNOWN_RESOURCES_KEY, JSON.stringify(resourceUrls));
-
-    return { additions, removals };
+    return diffBetweenFolds(before, after);
 }
 
 /**
- * Full initial sync — fetch all resources from the container.
+ * Full initial sync — identical to `syncFromPod` for the DAG model: it walks
+ * every commit the pod exposes and its ancestry. Kept as a distinct entry point
+ * for callers that want an explicit cold-start fetch.
  */
 export async function fullSync(
     podUrl: string,
     containerPath: string,
     authToken?: string,
 ): Promise<PerspectiveDiff> {
-    const containerUrl = linksContainerUrl(podUrl, containerPath);
-    const storage = getStorage();
-
-    // Fetch container listing
-    const response = await ldpGet(containerUrl, "text/turtle", undefined, authToken);
-    if (response.status < 200 || response.status >= 300) {
-        return { additions: [], removals: [] };
-    }
-
-    // Store ETag
-    const etag = response.headers["etag"] || response.headers["ETag"];
-    if (etag) {
-        storage.put(SYNC_ETAG_KEY, etag);
-    }
-
-    // Parse container
-    const containerGraph = parseTurtle(response.body, containerUrl);
-    const containedUris = getObjects(containerGraph, containerUrl, ldp.contains);
-    const resourceUrls = extractContainedResources(containerUrl, containedUris);
-
-    // Fetch all resources
-    const additions: LinkExpression[] = [];
-    for (const resourceUrl of resourceUrls) {
-        const turtle = await fetchTurtle(resourceUrl, authToken);
-        if (turtle) {
-            const links = graphToLinks(parseTurtle(turtle, resourceUrl), resourceUrl);
-            additions.push(...links);
-            for (const link of links) {
-                store.putLink(link);
-            }
-        }
-    }
-
-    // Store known resources
-    storage.put(KNOWN_RESOURCES_KEY, JSON.stringify(resourceUrls));
-
-    return { additions, removals: [] };
+    return syncFromPod(podUrl, containerPath, authToken);
 }
 
 /**
- * Get the current sync ETag (for external monitoring).
+ * The current DAG head set (for external monitoring / debugging).
  */
-export function getSyncEtag(): string | null {
-    return getStorage().get(SYNC_ETAG_KEY);
+export function getHeads(): string[] {
+    return store.getHeads();
 }
