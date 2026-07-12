@@ -177,10 +177,33 @@ describe("Cross-runtime: Store operations", () => {
         assert.equal(store.allLinks().links.length, 2);
     });
 
-    it("manages revision tracking", () => {
+    it("derives revision from the DAG head set (not an opaque cursor)", () => {
+        // Empty DAG ⇒ null revision.
         assert.equal(store.getRevision(), null);
-        store.setRevision("rev-42");
-        assert.equal(store.getRevision(), "rev-42");
+
+        // One commit ⇒ revision is that commit's content hash (a DAG pointer).
+        const c1 = {
+            additions: [makeLinkExpression()],
+            removals: [],
+            previous: [] as string[],
+            author: "did:key:z6MkTest",
+            timestamp: "2026-05-02T00:00:00.000Z",
+        };
+        const h1 = store.hashCommit(c1);
+        store.addCommitToDag(h1, c1);
+        assert.equal(store.getRevision(), h1);
+
+        // A child commit advances the single head to the child hash.
+        const c2 = {
+            additions: [makeLinkExpression({ data: { source: "a", target: "b", predicate: "c" } })],
+            removals: [],
+            previous: [h1],
+            author: "did:key:z6MkTest",
+            timestamp: "2026-05-02T00:01:00.000Z",
+        };
+        const h2 = store.hashCommit(c2);
+        store.addCommitToDag(h2, c2);
+        assert.equal(store.getRevision(), h2);
     });
 
     it("manages peers", () => {

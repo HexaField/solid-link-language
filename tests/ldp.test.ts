@@ -14,6 +14,9 @@ import {
     deleteHeaders,
     linksContainerUrl,
     linkResourceUrl,
+    diffsContainerUrl,
+    diffResourceUrl,
+    extractCommitHash,
     metaResourceUrl,
     membersResourceUrl,
     aclResourceUrl,
@@ -134,6 +137,50 @@ describe("linkResourceUrl", () => {
     it("builds correct URL", () => {
         const url = linkResourceUrl("https://pod.example.com/links/", "Qm789ghi");
         assert.equal(url, "https://pod.example.com/links/link-Qm789ghi.ttl");
+    });
+});
+
+describe("diffsContainerUrl", () => {
+    it("builds the diff-DAG container URL", () => {
+        const url = diffsContainerUrl("https://pod.example.com", "/ad4m/neighbourhoods/test");
+        assert.equal(url, "https://pod.example.com/ad4m/neighbourhoods/test/diffs/");
+    });
+
+    it("handles trailing slashes", () => {
+        const url = diffsContainerUrl("https://pod.example.com/", "/ad4m/test/");
+        assert.equal(url, "https://pod.example.com/ad4m/test/diffs/");
+    });
+});
+
+describe("diffResourceUrl", () => {
+    it("names the resource by its content hash", () => {
+        const url = diffResourceUrl("https://pod.example.com/diffs/", "Qm789ghi");
+        assert.equal(url, "https://pod.example.com/diffs/diff-Qm789ghi.ttl");
+    });
+
+    it("is deterministic for a given hash (immutable resource)", () => {
+        const a = diffResourceUrl("https://pod.example.com/diffs/", "QmABC");
+        const b = diffResourceUrl("https://pod.example.com/diffs", "QmABC");
+        assert.equal(a, b);
+    });
+});
+
+describe("extractCommitHash", () => {
+    it("extracts the commit hash from a diff-resource URL", () => {
+        assert.equal(
+            extractCommitHash("https://pod.example.com/diffs/diff-Qm789ghi.ttl"),
+            "Qm789ghi",
+        );
+    });
+
+    it("round-trips with diffResourceUrl", () => {
+        const url = diffResourceUrl("https://pod.example.com/diffs/", "QmRoundTrip123");
+        assert.equal(extractCommitHash(url), "QmRoundTrip123");
+    });
+
+    it("returns null for non-diff URLs", () => {
+        assert.equal(extractCommitHash("https://pod.example.com/diffs/"), null);
+        assert.equal(extractCommitHash("https://pod.example.com/links/link-Qm789ghi.ttl"), null);
     });
 });
 

@@ -1,20 +1,30 @@
 /**
- * Tests for container polling and ETag-based sync.
+ * Sync tests — the emulated diff-DAG walk over LDP.
+ *
+ * These exercise the real convergence path: a mock pod serves a `diffs/`
+ * container listing plus immutable diff-commit resources (with ad4m:previous
+ * pointers). `syncFromPod` must discover heads, walk ancestry (re-requesting
+ * missing parents), fold the DAG with OR-Set semantics, and emit an incremental
+ * PerspectiveDiff. It must NEVER snapshot-diff a container of link resources.
  */
 
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
-import type { StorageAdapter } from "../src/adapters.js";
-import { initStorage } from "../src/adapters.js";
-import type { Transport, TransportResponse } from "../src/adapters.js";
-import { initTransport } from "../src/adapters.js";
-import type { RuntimeAdapter } from "../src/adapters.js";
-import { initRuntime } from "../src/adapters.js";
+import type { StorageAdapter, Transport, TransportResponse, RuntimeAdapter } from "../src/adapters.js";
+import { initStorage, initTransport, initRuntime } from "../src/adapters.js";
 
-import { syncFromPod, fullSync, getSyncEtag } from "../src/sync.js";
+import { syncFromPod, fullSync, getHeads } from "../src/sync.js";
 import * as store from "../src/store.js";
-import { AD4M_NS, RDF_NS, XSD_NS, LDP_NS } from "../src/ontology.js";
+import {
+    buildCommit,
+    commitToTurtle,
+    commitHash,
+    type DiffCommit,
+} from "../src/diffdag.js";
+import { diffsContainerUrl, diffResourceUrl } from "../src/ldp.js";
+import { LDP_NS } from "../src/ontology.js";
+import type { LinkExpression, PerspectiveDiff } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -32,30 +42,32 @@ class MockStorage implements StorageAdapter {
 
 class MockTransport implements Transport {
     private responses = new Map<string, TransportResponse>();
-    public requests: Array<{ url: string; method: string }> = [];
+    public gets: string[] = [];
 
-    addResponse(url: string, response: TransportResponse): void {
-        this.responses.set(url, response);
+    addResponse(url: string, body: string, status = 200): void {
+        this.responses.set(url, { status, headers: {}, body });
     }
 
-    async fetch(url: string, method: string, _headers: Record<string, string>, _body: string): Promise<TransportResponse> {
-        this.requests.push({ url, method });
-        const resp = this.responses.get(url);
-        if (!resp) return { status: 404, headers: {}, body: "Not found" };
-        return resp;
+    async fetch(url: string, method: string, _h: Record<string, string>, _b: string): Promise<TransportResponse> {
+        if (method === "GET") this.gets.push(url);
+        return this.responses.get(url) ?? { status: 404, headers: {}, body: "Not found" };
     }
 }
 
+/** Deterministic content-address-like hash sufficient for tests. */
 function simpleHash(data: string): string {
     let h = 0;
     for (let i = 0; i < data.length; i++) { h = ((h << 5) - h + data.charCodeAt(i)) | 0; }
-    return `Qm${Math.abs(h).toString(16)}`;
+    // widen a little so distinct inputs rarely collide in a test
+    let h2 = 5381;
+    for (let i = 0; i < data.length; i++) { h2 = ((h2 << 5) + h2 + data.charCodeAt(i)) | 0; }
+    return `Qm${Math.abs(h).toString(16)}${Math.abs(h2).toString(16)}`;
 }
 
 class MockRuntime implements RuntimeAdapter {
     hash(data: string): string { return simpleHash(data); }
-    emitSignal(_data: string): void {}
-    emitPerspectiveDiff(_diff: unknown): void {}
+    emitSignal(): void {}
+    emitPerspectiveDiff(): void {}
 }
 
 // ---------------------------------------------------------------------------
@@ -64,149 +76,211 @@ class MockRuntime implements RuntimeAdapter {
 
 const POD_URL = "https://pod.example.com";
 const CONTAINER_PATH = "/ad4m/neighbourhoods/test";
-const CONTAINER_URL = `${POD_URL}${CONTAINER_PATH}/links/`;
+const DIFFS_URL = diffsContainerUrl(POD_URL, CONTAINER_PATH);
 
-function makeLinkTurtle(source: string, predicate: string, target: string): string {
-    return [
-        `@prefix ad4m: <${AD4M_NS}> .`,
-        `@prefix rdf: <${RDF_NS}> .`,
-        `@prefix xsd: <${XSD_NS}> .`,
-        ``,
-        `<#link-1> a ad4m:LinkExpression ;`,
-        `    rdf:subject <${source}> ;`,
-        `    rdf:predicate <${predicate}> ;`,
-        `    rdf:object <${target}> ;`,
-        `    ad4m:author "did:key:z6MkTest" ;`,
-        `    ad4m:timestamp "2026-05-02T12:00:00.000Z"^^xsd:dateTime ;`,
-        `    ad4m:proofSignature "sig" ;`,
-        `    ad4m:proofKey "key" .`,
-    ].join("\n");
+function makeLink(overrides?: Partial<LinkExpression> & { data?: Partial<LinkExpression["data"]> }): LinkExpression {
+    return {
+        author: "did:key:z6MkTest",
+        timestamp: "2026-05-02T12:00:00.000Z",
+        data: {
+            source: "channel://main",
+            predicate: "flux://has_message",
+            target: "expr://msg1",
+            ...(overrides?.data ?? {}),
+        },
+        proof: { signature: "sig", key: "key" },
+        ...(() => { const o = { ...overrides }; delete (o as any).data; return o; })(),
+    };
 }
 
-function makeContainerListing(resources: string[]): string {
-    if (resources.length === 0) {
+function makeContainerListing(resourceUrls: string[]): string {
+    if (resourceUrls.length === 0) {
         return `@prefix ldp: <${LDP_NS}> .\n<> a ldp:BasicContainer .`;
     }
-    const contains = resources.map(r => `<${r}>`).join(", ");
+    const contains = resourceUrls.map(r => `<${r}>`).join(", ");
     return `@prefix ldp: <${LDP_NS}> .\n<> a ldp:BasicContainer ;\n    ldp:contains ${contains} .`;
+}
+
+/** Build a commit, serialise it to Turtle, and register it on the mock pod. */
+function publishCommit(
+    transport: MockTransport,
+    diff: PerspectiveDiff,
+    parents: string[],
+    opts?: { author?: string; timestamp?: string },
+): { hash: string; commit: DiffCommit } {
+    const commit = buildCommit(
+        diff,
+        parents,
+        opts?.author ?? "did:key:z6MkTest",
+        opts?.timestamp ?? "2026-05-02T12:00:00.000Z",
+        simpleHash,
+    );
+    const hash = commitHash(commit, simpleHash);
+    transport.addResponse(diffResourceUrl(DIFFS_URL, hash), commitToTurtle(commit, simpleHash));
+    return { hash, commit };
+}
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+let storage: MockStorage;
+let transport: MockTransport;
+
+function setup(): void {
+    storage = new MockStorage();
+    transport = new MockTransport();
+    initStorage(storage);
+    initTransport(transport);
+    initRuntime(new MockRuntime());
+    store.initStore(simpleHash);
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-let mockStorage: MockStorage;
-let mockTransport: MockTransport;
+describe("syncFromPod: DAG discovery + fold", () => {
+    beforeEach(setup);
 
-function setup(): void {
-    mockStorage = new MockStorage();
-    mockTransport = new MockTransport();
-    initStorage(mockStorage);
-    initTransport(mockTransport);
-    initRuntime(new MockRuntime());
-    store.initStore(simpleHash);
-}
-
-describe("fullSync", () => {
-    beforeEach(() => { setup(); });
-
-    it("fetches all resources from container", async () => {
-        const r1 = `${CONTAINER_URL}link-abc.ttl`;
-        const r2 = `${CONTAINER_URL}link-def.ttl`;
-
-        mockTransport.addResponse(CONTAINER_URL, {
-            status: 200,
-            headers: { "ETag": '"etag-1"' },
-            body: makeContainerListing([r1, r2]),
-        });
-        mockTransport.addResponse(r1, {
-            status: 200, headers: {},
-            body: makeLinkTurtle("channel://main", "flux://has_message", "expr://msg1"),
-        });
-        mockTransport.addResponse(r2, {
-            status: 200, headers: {},
-            body: makeLinkTurtle("channel://general", "flux://has_reply", "expr://msg2"),
-        });
-
-        const diff = await fullSync(POD_URL, CONTAINER_PATH);
-        assert.equal(diff.additions.length, 2);
+    it("returns empty diff when the pod has no diffs container", async () => {
+        transport.addResponse(DIFFS_URL, "Not found", 404);
+        const diff = await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(diff.additions.length, 0);
         assert.equal(diff.removals.length, 0);
     });
 
-    it("stores container ETag", async () => {
-        mockTransport.addResponse(CONTAINER_URL, {
-            status: 200,
-            headers: { "ETag": '"container-etag"' },
-            body: makeContainerListing([]),
-        });
-
-        await fullSync(POD_URL, CONTAINER_PATH);
-        assert.equal(getSyncEtag(), '"container-etag"');
-    });
-
-    it("handles empty container", async () => {
-        mockTransport.addResponse(CONTAINER_URL, {
-            status: 200, headers: {},
-            body: makeContainerListing([]),
-        });
-
-        const diff = await fullSync(POD_URL, CONTAINER_PATH);
-        assert.equal(diff.additions.length, 0);
-    });
-
-    it("handles container fetch failure", async () => {
-        mockTransport.addResponse(CONTAINER_URL, {
-            status: 500, headers: {}, body: "Server Error",
-        });
-
-        const diff = await fullSync(POD_URL, CONTAINER_PATH);
-        assert.equal(diff.additions.length, 0);
-    });
-});
-
-describe("syncFromPod", () => {
-    beforeEach(() => { setup(); });
-
-    it("detects new resources", async () => {
-        const r1 = `${CONTAINER_URL}link-new.ttl`;
-
-        mockTransport.addResponse(CONTAINER_URL, {
-            status: 200,
-            headers: { "ETag": '"etag-2"' },
-            body: makeContainerListing([r1]),
-        });
-        mockTransport.addResponse(r1, {
-            status: 200, headers: {},
-            body: makeLinkTurtle("channel://main", "flux://has_message", "expr://new"),
-        });
+    it("fetches a single genesis commit and materialises its link", async () => {
+        const link = makeLink({ data: { target: "expr://new" } });
+        const { hash } = publishCommit(transport, { additions: [link], removals: [] }, []);
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, hash)]));
 
         const diff = await syncFromPod(POD_URL, CONTAINER_PATH);
         assert.equal(diff.additions.length, 1);
         assert.equal(diff.additions[0].data.target, "expr://new");
+        // Revision is the head commit hash — a pointer into the DAG.
+        assert.equal(store.getRevision(), hash);
+        assert.deepEqual(getHeads(), [hash]);
     });
 
-    it("returns empty diff when container unchanged (304)", async () => {
-        mockStorage.put("solid:sync:etag", '"etag-unchanged"');
+    it("walks ad4m:previous ancestry, re-requesting missing parents", async () => {
+        // Chain: c1 (genesis) <- c2 <- c3. Only c3 is listed in the container;
+        // c1 and c2 must be re-requested by following parent pointers.
+        const l1 = makeLink({ data: { target: "expr://1" } });
+        const l2 = makeLink({ data: { target: "expr://2" } });
+        const l3 = makeLink({ data: { target: "expr://3" } });
 
-        mockTransport.addResponse(CONTAINER_URL, {
-            status: 304, headers: {}, body: "",
-        });
+        const c1 = publishCommit(transport, { additions: [l1], removals: [] }, []);
+        const c2 = publishCommit(transport, { additions: [l2], removals: [] }, [c1.hash]);
+        const c3 = publishCommit(transport, { additions: [l3], removals: [] }, [c2.hash]);
+
+        // Container advertises ONLY the head.
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, c3.hash)]));
 
         const diff = await syncFromPod(POD_URL, CONTAINER_PATH);
-        assert.equal(diff.additions.length, 0);
-        assert.equal(diff.removals.length, 0);
+        const targets = diff.additions.map(l => l.data.target).sort();
+        assert.deepEqual(targets, ["expr://1", "expr://2", "expr://3"]);
+
+        // All three commits were fetched (ancestry walk).
+        assert.ok(transport.gets.includes(diffResourceUrl(DIFFS_URL, c1.hash)));
+        assert.ok(transport.gets.includes(diffResourceUrl(DIFFS_URL, c2.hash)));
+        assert.ok(transport.gets.includes(diffResourceUrl(DIFFS_URL, c3.hash)));
+        // Head is the tip of the chain.
+        assert.deepEqual(getHeads(), [c3.hash]);
+    });
+
+    it("emits only the incremental diff on a second sync", async () => {
+        const l1 = makeLink({ data: { target: "expr://1" } });
+        const c1 = publishCommit(transport, { additions: [l1], removals: [] }, []);
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, c1.hash)]));
+
+        const first = await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(first.additions.length, 1);
+
+        // Add a second commit; re-list the container with both.
+        const l2 = makeLink({ data: { target: "expr://2" } });
+        const c2 = publishCommit(transport, { additions: [l2], removals: [] }, [c1.hash]);
+        transport.addResponse(
+            DIFFS_URL,
+            makeContainerListing([diffResourceUrl(DIFFS_URL, c1.hash), diffResourceUrl(DIFFS_URL, c2.hash)]),
+        );
+
+        const second = await syncFromPod(POD_URL, CONTAINER_PATH);
+        // Only the newly-appeared link is emitted.
+        assert.equal(second.additions.length, 1);
+        assert.equal(second.additions[0].data.target, "expr://2");
+    });
+
+    it("is idempotent: re-syncing the same DAG emits nothing new", async () => {
+        const { hash } = publishCommit(transport, { additions: [makeLink()], removals: [] }, []);
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, hash)]));
+
+        await syncFromPod(POD_URL, CONTAINER_PATH);
+        const again = await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(again.additions.length, 0);
+        assert.equal(again.removals.length, 0);
     });
 });
 
-describe("getSyncEtag", () => {
-    beforeEach(() => { setup(); });
+describe("syncFromPod: removal convergence via tombstones", () => {
+    beforeEach(setup);
 
-    it("returns null when no etag stored", () => {
-        assert.equal(getSyncEtag(), null);
+    it("a tombstone commit removes the original add on fold", async () => {
+        const link = makeLink({ data: { target: "expr://removeme" } });
+        const add = publishCommit(transport, { additions: [link], removals: [] }, []);
+        // Removal commit carries the ORIGINAL link (tombstone keyed by its hash).
+        const rm = publishCommit(transport, { additions: [], removals: [link] }, [add.hash]);
+
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, rm.hash)]));
+
+        const diff = await syncFromPod(POD_URL, CONTAINER_PATH);
+        // Net effect on a fresh replica: the link is absent (add - tombstone).
+        assert.equal(diff.additions.length, 0);
+        assert.equal(store.allLinks().links.length, 0);
     });
 
-    it("returns stored etag", () => {
-        mockStorage.put("solid:sync:etag", '"p1"');
-        assert.equal(getSyncEtag(), '"p1"');
+    it("removal after a prior sync emits the link as a removal", async () => {
+        const link = makeLink({ data: { target: "expr://x" } });
+        const add = publishCommit(transport, { additions: [link], removals: [] }, []);
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, add.hash)]));
+
+        const first = await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(first.additions.length, 1);
+
+        const rm = publishCommit(transport, { additions: [], removals: [link] }, [add.hash]);
+        transport.addResponse(
+            DIFFS_URL,
+            makeContainerListing([diffResourceUrl(DIFFS_URL, add.hash), diffResourceUrl(DIFFS_URL, rm.hash)]),
+        );
+
+        const second = await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(second.removals.length, 1);
+        assert.equal(second.removals[0].data.target, "expr://x");
+        assert.equal(store.allLinks().links.length, 0);
+    });
+});
+
+describe("fullSync", () => {
+    beforeEach(setup);
+
+    it("walks the whole DAG the pod exposes", async () => {
+        const l1 = makeLink({ data: { target: "expr://a" } });
+        const l2 = makeLink({ data: { target: "expr://b" } });
+        const c1 = publishCommit(transport, { additions: [l1], removals: [] }, []);
+        const c2 = publishCommit(transport, { additions: [l2], removals: [] }, [c1.hash]);
+        transport.addResponse(
+            DIFFS_URL,
+            makeContainerListing([diffResourceUrl(DIFFS_URL, c1.hash), diffResourceUrl(DIFFS_URL, c2.hash)]),
+        );
+
+        const diff = await fullSync(POD_URL, CONTAINER_PATH);
+        assert.equal(diff.additions.length, 2);
+    });
+
+    it("handles an empty diffs container", async () => {
+        transport.addResponse(DIFFS_URL, makeContainerListing([]));
+        const diff = await fullSync(POD_URL, CONTAINER_PATH);
+        assert.equal(diff.additions.length, 0);
+        assert.equal(store.getRevision(), null);
     });
 });
