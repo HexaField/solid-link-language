@@ -65,9 +65,17 @@ function simpleHash(data: string): string {
 }
 
 class MockRuntime implements RuntimeAdapter {
+    /**
+     * Records every PerspectiveDiff pushed through the host emit channel. This
+     * is the SEAM that proves inbound peer folds are actually surfaced to the
+     * executor: the AD4M runtime discards sync()'s return value, so links become
+     * queryable ONLY via emitPerspectiveDiff. A silent no-op here would let the
+     * A=10/B=10 convergence freeze pass the suite unnoticed.
+     */
+    public emittedDiffs: PerspectiveDiff[] = [];
     hash(data: string): string { return simpleHash(data); }
     emitSignal(): void {}
-    emitPerspectiveDiff(): void {}
+    emitPerspectiveDiff(diff: PerspectiveDiff): void { this.emittedDiffs.push(diff); }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,13 +134,15 @@ function publishCommit(
 
 let storage: MockStorage;
 let transport: MockTransport;
+let runtime: MockRuntime;
 
 function setup(): void {
     storage = new MockStorage();
     transport = new MockTransport();
+    runtime = new MockRuntime();
     initStorage(storage);
     initTransport(transport);
-    initRuntime(new MockRuntime());
+    initRuntime(runtime);
     store.initStore(simpleHash);
 }
 
@@ -219,6 +229,75 @@ describe("syncFromPod: DAG discovery + fold", () => {
         const again = await syncFromPod(POD_URL, CONTAINER_PATH);
         assert.equal(again.additions.length, 0);
         assert.equal(again.removals.length, 0);
+    });
+});
+
+describe("syncFromPod: emits inbound folds to the executor", () => {
+    beforeEach(setup);
+
+    // REGRESSION: the AD4M runtime DISCARDS sync()'s return value —
+    // `Language::sync()` runs `perspectiveSyncSync()` purely for side effects
+    // (rust-executor/src/languages/language.rs). Inbound peer links become
+    // queryable on the perspective ONLY through the emitPerspectiveDiff host
+    // channel. Without the emit inside syncFromPod, the pod's diff-DAG folds
+    // correctly into the language's own store but `perspective.queryLinks`
+    // never sees remote links — the observed live C1 freeze at A=10/B=10 that
+    // this suite previously failed to catch because MockRuntime.emitPerspectiveDiff
+    // was a silent no-op.
+    it("pushes newly-folded peer links through emitPerspectiveDiff exactly once", async () => {
+        const l1 = makeLink({ data: { target: "expr://peer-1" } });
+        const l2 = makeLink({ data: { target: "expr://peer-2" } });
+        const c1 = publishCommit(transport, { additions: [l1], removals: [] }, []);
+        const c2 = publishCommit(transport, { additions: [l2], removals: [] }, [c1.hash]);
+        transport.addResponse(
+            DIFFS_URL,
+            makeContainerListing([diffResourceUrl(DIFFS_URL, c1.hash), diffResourceUrl(DIFFS_URL, c2.hash)]),
+        );
+
+        const returned = await syncFromPod(POD_URL, CONTAINER_PATH);
+
+        // The fold happened...
+        assert.equal(returned.additions.length, 2);
+        // ...AND it was pushed to the executor (not just returned into the void).
+        assert.equal(runtime.emittedDiffs.length, 1, "expected exactly one emitPerspectiveDiff for a non-empty fold");
+        const emitted = runtime.emittedDiffs[0];
+        const emittedTargets = emitted.additions.map(l => l.data.target).sort();
+        assert.deepEqual(emittedTargets, ["expr://peer-1", "expr://peer-2"]);
+        assert.equal(emitted.removals.length, 0);
+    });
+
+    it("does NOT emit when the fold is empty (idempotent re-sync)", async () => {
+        const { hash } = publishCommit(transport, { additions: [makeLink()], removals: [] }, []);
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, hash)]));
+
+        await syncFromPod(POD_URL, CONTAINER_PATH);
+        const emittedAfterFirst = runtime.emittedDiffs.length;
+        assert.equal(emittedAfterFirst, 1);
+
+        // Second sync sees no new commits — nothing must be pushed to the executor.
+        await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(runtime.emittedDiffs.length, emittedAfterFirst, "empty fold must not emit");
+    });
+
+    it("emits a removal delta when a tombstone lands after a prior sync", async () => {
+        const link = makeLink({ data: { target: "expr://gone" } });
+        const add = publishCommit(transport, { additions: [link], removals: [] }, []);
+        transport.addResponse(DIFFS_URL, makeContainerListing([diffResourceUrl(DIFFS_URL, add.hash)]));
+
+        await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(runtime.emittedDiffs.length, 1);
+
+        const rm = publishCommit(transport, { additions: [], removals: [link] }, [add.hash]);
+        transport.addResponse(
+            DIFFS_URL,
+            makeContainerListing([diffResourceUrl(DIFFS_URL, add.hash), diffResourceUrl(DIFFS_URL, rm.hash)]),
+        );
+
+        await syncFromPod(POD_URL, CONTAINER_PATH);
+        assert.equal(runtime.emittedDiffs.length, 2, "tombstone fold must emit a second diff");
+        const removalDelta = runtime.emittedDiffs[1];
+        assert.equal(removalDelta.removals.length, 1);
+        assert.equal(removalDelta.removals[0].data.target, "expr://gone");
     });
 });
 

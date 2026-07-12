@@ -98,6 +98,53 @@ against a running pod is not in CI.
 
 ## Gotchas
 
+- **The executor DISCARDS `sync()`'s return value.** `Language::sync()`
+  (rust-executor) runs `perspectiveSyncSync()` purely for its side effects;
+  returning a `PerspectiveDiff` from `sync()`/`syncFromPod` does NOT make inbound
+  links queryable. Peer links become visible on the perspective ONLY when pushed
+  through the `emitPerspectiveDiff` host channel. `syncFromPod` therefore emits
+  its before/after fold delta via `getRuntime().emitPerspectiveDiff(delta)` (guarded
+  on a non-empty delta) — see `src/sync.ts`. Without this the pod's diff-DAG folds
+  correctly into the local store but `perspective.queryLinks` never sees remote
+  links: the live C1 freeze at **A=10/B=10** (each agent seeing only its own
+  writes). The same host-contract trap bit Nostr and Hypercore. `commit()` already
+  emits the local diff; the sync incremental delta excludes already-folded local
+  links (the DAG dedups by commit hash), so there is no double-apply. `handleSignal`
+  must NOT also fire `linkCallback` for an inbound update — `syncFromPod` already
+  emits it. Regression: `tests/sync.test.ts` → "emits inbound folds to the executor"
+  (a spy RuntimeAdapter asserting a non-empty fold emits exactly one diff; the test
+  a silent no-op mock previously let pass).
+- **Pod-URL / container-path joining must go through `joinPodPath`.** The
+  wind-tunnel templates the language with `SOLID_POD_URL` carrying **no** trailing
+  slash (`http://127.0.0.1:3005`) and `SOLID_CONTAINER_PATH` carrying **no** leading
+  slash (`ad4m/c1-<uuid>/`). A naive `podUrl + containerPath` concatenation yields
+  the invalid `http://127.0.0.1:3005ad4m/c1-<uuid>/diffs/` — every `httpFetch` then
+  throws, each agent keeps only its own writes, and C1 freezes at **A=10/B=10** (the
+  same surface symptom as the emit trap, different cause). `joinPodPath` (`src/ldp.ts`)
+  strips trailing slashes off the base, leading/trailing off the path, and rejoins
+  with exactly one separator; **all** container/resource builders
+  (`linksContainerUrl`, `diffsContainerUrl`, `viewsContainerUrl`, `metaResourceUrl`,
+  `membersResourceUrl`) route through it. This was invisible to the original unit
+  tests because their fixtures used **leading-slash** container paths (`/ad4m/...`),
+  which happen to concatenate correctly. Regression: `tests/ldp.test.ts` →
+  "joinPodPath (slash-normalisation matrix)" + "container builders reject the
+  no-separator concatenation bug" (asserts the exact wind-tunnel shape resolves to a
+  `new URL()`-parseable string with no `3005ad4m` glue).
+- **The OR-Set identity key EXCLUDES `proof`.** `hashLinkContent` (`src/diffdag.ts`)
+  keys a link on `[source, predicate, target, author, timestamp]` and DELIBERATELY
+  omits the signature/key. Reason: when AD4M's `perspective.removeLink` hands the
+  language a removal, the executor does **not** round-trip the original signature —
+  the tombstone LinkExpression arrives with an **empty proof** (`signature:""`,
+  `key:""`). If proof were part of the key, a peer replica that folded the ADD with
+  its real signature would compute a different hash than the empty-proof tombstone,
+  so the tombstone could never reference the add's hash and removals would never fold
+  out on peers. Symptom: adds converge 20/20 but removal freezes (times out at
+  `C1_TIMEOUT_MS`). `timestamp` stays in the key because it DOES round-trip through
+  `removeLink`; this matches the sibling nostr/ipfs convention
+  (`source:predicate:target:author:timestamp`). Changing the key rehashes every
+  commit globally but deterministically. Regression: `tests/diffdag.test.ts` →
+  "a tombstone converges against its add even when the removal's proof is stripped"
+  and "timestamp remains part of the identity key (it round-trips; proof does not)".
 - The `interactions()` capability returning `[]` is the legitimate
   language-interface no-op (matches the `p-diff-sync` reference). Keep it; it is
   not the doc-fiction to strip.

@@ -38,13 +38,22 @@ for Solid this is a *near-identity* projection, which is the whole point.
 - **`sync()`** discovers the commit resources in the pod's `diffs/` container,
   then **walks the `ad4m:previous` chain**: it fetches each head, follows parent
   pointers, and pulls any missing ancestors until the local DAG is complete. It
-  re-folds and returns the diff between the pre-sync and post-sync link sets. It
-  does **not** snapshot-diff the container listing or rely on container ETags.
+  re-folds and **pushes the pre-sync→post-sync delta through the executor's
+  `emitPerspectiveDiff` host channel**, then returns it. The push is load-bearing:
+  the AD4M runtime *discards* `sync()`'s return value (it runs the sync purely for
+  side effects), so inbound peer links become queryable on the perspective only via
+  `emitPerspectiveDiff` — returning them is not enough. It does **not** snapshot-diff
+  the container listing or rely on container ETags.
 - **Merge is an OR-Set** keyed by link content hash: the folded link set is the
   union of all added links minus those whose hash appears in a tombstone. This
   makes merges commutative — concurrent branches fold to the same link set, and
   a concurrent add+remove of the same link converges to removed — regardless of
-  fetch order.
+  fetch order. The content hash is `[source, predicate, target, author,
+  timestamp]` and **deliberately excludes `proof`**: AD4M's `removeLink` hands the
+  language an empty-proof tombstone (the executor does not round-trip the original
+  signature), so a proof-in-key tombstone could never match the signed add a peer
+  folded, and removals would never converge. `timestamp` stays in the key because
+  it *does* round-trip — matching the sibling nostr/ipfs convention.
 - **`currentRevision()`** is derived from the DAG head set, not the container
   ETag: `null` when the DAG is empty, the single head's commit hash when there
   is one head, and a deterministic digest of the sorted head hashes when there
@@ -169,10 +178,17 @@ live pod required:
   the original link hash in a tombstone.
 - `tests/sync.test.ts` — the DAG-walk sync against a mock pod: ancestry walk
   re-requesting missing parents, incremental diffs, idempotent re-sync, and
-  removal convergence via tombstones.
+  removal convergence via tombstones. Also asserts the **emit contract** via a
+  spy runtime — a non-empty fold pushes exactly one `emitPerspectiveDiff` carrying
+  the peer links, an empty fold emits nothing, and a tombstone fold emits a removal
+  delta (the invariant a silent no-op mock previously let slip, surfacing live as
+  the C1 A=10/B=10 freeze).
 - `tests/ldp.test.ts` — the content-hash resource URL builders
   (`diffsContainerUrl`, `diffResourceUrl`, `extractCommitHash`) and header/URL
-  helpers.
+  helpers, plus the **`joinPodPath` slash-normalisation matrix**: a no-trailing-slash
+  pod URL joined to a no-leading-slash container path must resolve to a
+  `new URL()`-parseable string with exactly one separator (not the glued
+  `…3005ad4m/…` that threw on every fetch and froze C1 at A=10/B=10).
 - `tests/cross-runtime.test.ts` — revision derivation through the store.
 - `tests/projection.test.ts` — Channel B core: the literal codec, node-expression
   evaluator, SHACL profile parsing, `project`/`ingest` round-trip, and the Solid

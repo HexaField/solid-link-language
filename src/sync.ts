@@ -22,7 +22,7 @@
  */
 
 import type { PerspectiveDiff } from "./types.js";
-import { getStorage } from "./adapters.js";
+import { getStorage, getRuntime } from "./adapters.js";
 import { fetchTurtle } from "./ldp.js";
 import { parseTurtle, getObjects } from "./rdf.js";
 import { ldp } from "./ontology.js";
@@ -161,7 +161,24 @@ export async function syncFromPod(
     // Rebuild the derived query/render cache to match the authoritative fold.
     store.rebuildLinksFromDag();
 
-    return diffBetweenFolds(before, after);
+    const delta = diffBetweenFolds(before, after);
+
+    // PUSH the delta to the executor. This is load-bearing: the AD4M runtime
+    // DISCARDS sync()'s return value — `Language::sync()` runs
+    // `perspectiveSyncSync()` purely for its side effects
+    // (rust-executor/src/languages/language.rs). Inbound diff-DAG links
+    // therefore become queryable on the perspective ONLY through the
+    // emitPerspectiveDiff host channel. Without this emit the pod's diff-DAG
+    // folds correctly into the language's own store, but `perspective.queryLinks`
+    // never sees remote links and convergence never completes against a real pod
+    // (the observed C1 A=10/B=10 freeze). Locally-committed links are already
+    // applied by commit(); their echo folds to an empty delta here (the DAG
+    // dedups by commit hash), so this never double-applies a local write.
+    if (delta.additions.length > 0 || delta.removals.length > 0) {
+        getRuntime().emitPerspectiveDiff(delta);
+    }
+
+    return delta;
 }
 
 /**

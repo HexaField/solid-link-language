@@ -77,6 +77,19 @@ export interface DiffCommit {
  * and the identifier a tombstone references. Field order is fixed and parents
  * are irrelevant, so the same logical link always hashes identically across
  * replicas and restarts.
+ *
+ * The key is the link's STABLE IDENTITY — source, predicate, target, author,
+ * timestamp — and DELIBERATELY EXCLUDES `proof` (signature + key). A removal
+ * must converge against its original add, but AD4M's `removeLink` hands the
+ * language a LinkExpression with an EMPTY proof (the executor does not
+ * round-trip the original signature into the removal diff). If proof were part
+ * of the key, a tombstone (empty proof) could never reference an add whose hash
+ * baked in the real signature, so removals silently failed to fold out on peer
+ * replicas — the observed C1 A=20/B=20 add-converged-but-removal-frozen bug.
+ * timestamp DOES survive the round-trip (queryLinks returns the original) and is
+ * kept, matching the sibling diff-DAG languages (nostr/ipfs key identically:
+ * source:predicate:target:author:timestamp). Regression: tests/diffdag.test.ts
+ * → "a tombstone converges against its add even when proof is stripped".
  */
 export function hashLinkContent(
     link: LinkExpression,
@@ -88,8 +101,6 @@ export function hashLinkContent(
         link.data.target ?? null,
         link.author ?? null,
         link.timestamp ?? null,
-        link.proof?.signature ?? null,
-        link.proof?.key ?? null,
     ]);
     return hashFn(canonical);
 }

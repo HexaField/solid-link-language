@@ -12,10 +12,12 @@ import {
     postHeaders,
     patchHeaders,
     deleteHeaders,
+    joinPodPath,
     linksContainerUrl,
     linkResourceUrl,
     diffsContainerUrl,
     diffResourceUrl,
+    viewsContainerUrl,
     extractCommitHash,
     metaResourceUrl,
     membersResourceUrl,
@@ -120,6 +122,103 @@ describe("deleteHeaders", () => {
 // ---------------------------------------------------------------------------
 // URL builders
 // ---------------------------------------------------------------------------
+
+// Regression guard for the live C1 A=10/B=10 freeze. The wind-tunnel templates
+// SOLID_POD_URL with NO trailing slash ("http://127.0.0.1:3005") and
+// SOLID_CONTAINER_PATH with NO leading slash ("ad4m/c1-<uuid>/"). The old
+// builders concatenated base+path with no separator, producing an invalid URL
+// like "http://127.0.0.1:3005ad4m/c1-x/diffs/" — every httpFetch then threw, no
+// commit resource was ever written, and each agent saw only its own 10 links.
+// The pre-existing builder tests all used leading-slash "/ad4m/..." fixtures,
+// which masked the bug. These assert the full slash matrix and, critically, that
+// each result parses via `new URL()`.
+describe("joinPodPath (slash-normalisation matrix)", () => {
+    const expected = "http://127.0.0.1:3005/ad4m/c1-x/";
+
+    it("wind-tunnel shape: no trailing slash on pod, no leading slash on path", () => {
+        assert.equal(joinPodPath("http://127.0.0.1:3005", "ad4m/c1-x/"), expected);
+    });
+
+    it("no trailing slash on pod, no slashes on path at all", () => {
+        assert.equal(joinPodPath("http://127.0.0.1:3005", "ad4m/c1-x"), expected);
+    });
+
+    it("trailing slash on pod, leading slash on path", () => {
+        assert.equal(joinPodPath("http://127.0.0.1:3005/", "/ad4m/c1-x/"), expected);
+    });
+
+    it("both fully slashed", () => {
+        assert.equal(joinPodPath("http://127.0.0.1:3005/", "/ad4m/c1-x"), expected);
+    });
+
+    it("collapses redundant multi-slashes on both sides", () => {
+        assert.equal(joinPodPath("http://127.0.0.1:3005///", "///ad4m/c1-x///"), expected);
+    });
+
+    it("empty container path yields the bare pod root with one trailing slash", () => {
+        assert.equal(joinPodPath("http://127.0.0.1:3005", ""), "http://127.0.0.1:3005/");
+        assert.equal(joinPodPath("http://127.0.0.1:3005/", "/"), "http://127.0.0.1:3005/");
+    });
+
+    it("every joined path is a parseable absolute URL", () => {
+        for (const [pod, path] of [
+            ["http://127.0.0.1:3005", "ad4m/c1-x/"],
+            ["http://127.0.0.1:3005/", "/ad4m/c1-x/"],
+            ["https://pod.example.com", "ad4m/neighbourhoods/test"],
+        ] as const) {
+            const joined = joinPodPath(pod, path);
+            assert.doesNotThrow(() => new URL(joined), `joinPodPath(${pod}, ${path}) => ${joined}`);
+        }
+    });
+});
+
+describe("container builders reject the no-separator concatenation bug", () => {
+    // The exact inputs the wind-tunnel feeds the templated language.
+    const pod = "http://127.0.0.1:3005";
+    const container = "ad4m/c1-5e638525/";
+
+    it("diffsContainerUrl produces a valid, correctly-separated URL", () => {
+        const url = diffsContainerUrl(pod, container);
+        assert.equal(url, "http://127.0.0.1:3005/ad4m/c1-5e638525/diffs/");
+        assert.doesNotThrow(() => new URL(url));
+    });
+
+    it("linksContainerUrl produces a valid, correctly-separated URL", () => {
+        const url = linksContainerUrl(pod, container);
+        assert.equal(url, "http://127.0.0.1:3005/ad4m/c1-5e638525/links/");
+        assert.doesNotThrow(() => new URL(url));
+    });
+
+    it("viewsContainerUrl produces a valid, correctly-separated URL", () => {
+        const url = viewsContainerUrl(pod, container);
+        assert.equal(url, "http://127.0.0.1:3005/ad4m/c1-5e638525/views/");
+        assert.doesNotThrow(() => new URL(url));
+    });
+
+    it("metaResourceUrl produces a valid, correctly-separated URL", () => {
+        const url = metaResourceUrl(pod, container);
+        assert.equal(url, "http://127.0.0.1:3005/ad4m/c1-5e638525/meta.ttl");
+        assert.doesNotThrow(() => new URL(url));
+    });
+
+    it("membersResourceUrl produces a valid, correctly-separated URL", () => {
+        const url = membersResourceUrl(pod, container);
+        assert.equal(url, "http://127.0.0.1:3005/ad4m/c1-5e638525/members/index.ttl");
+        assert.doesNotThrow(() => new URL(url));
+    });
+
+    it("no builder ever emits the port glued to the path (the freeze signature)", () => {
+        for (const url of [
+            diffsContainerUrl(pod, container),
+            linksContainerUrl(pod, container),
+            viewsContainerUrl(pod, container),
+            metaResourceUrl(pod, container),
+            membersResourceUrl(pod, container),
+        ]) {
+            assert.ok(!url.includes("3005ad4m"), `saw the glued freeze signature in ${url}`);
+        }
+    });
+});
 
 describe("linksContainerUrl", () => {
     it("builds correct URL", () => {

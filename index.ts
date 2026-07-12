@@ -33,7 +33,7 @@ import * as store from "./src/store.js";
 import { buildCommit, commitToTurtle } from "./src/diffdag.js";
 import { syncFromPod, fullSync } from "./src/sync.js";
 import { ldpPut, ldpHead, ldpGet, resourceExists, fetchTurtle } from "./src/ldp.js";
-import { diffsContainerUrl, diffResourceUrl } from "./src/ldp.js";
+import { diffsContainerUrl, diffResourceUrl, joinPodPath } from "./src/ldp.js";
 import {
     viewsContainerUrl,
     viewResourceUrl,
@@ -393,8 +393,10 @@ async function ensureContainerExists(): Promise<void> {
         return h;
     };
 
-    // Create the parent container first.
-    const parentUrl = `${SOLID_POD_URL.replace(/\/$/, "")}${SOLID_CONTAINER_PATH.replace(/\/$/, "")}/`;
+    // Create the parent container first. joinPodPath normalises slashes so a
+    // pod URL with no trailing slash and a container path with no leading slash
+    // cannot concatenate into an invalid URL (see joinPodPath in src/ldp.ts).
+    const parentUrl = joinPodPath(SOLID_POD_URL, SOLID_CONTAINER_PATH);
     const parentExists = await resourceExists(parentUrl, token || undefined);
     if (!parentExists) {
         console.log(`[solid-link-language] creating parent container: ${parentUrl}`);
@@ -670,15 +672,15 @@ export async function handleSignal(signalData: string): Promise<void> {
     // Handle notifications from Solid Notifications Protocol
     const notification = signal as { type?: string; object?: string };
     if (notification.type === "Update" || notification.type === "Create") {
-        // A resource was created or updated — trigger sync
-        const diff = await syncFromPod(
+        // A resource was created or updated — walk the DAG and fold. syncFromPod
+        // pushes any newly-folded links to the executor via emitPerspectiveDiff
+        // (the same host channel the periodic sync() relies on), so no separate
+        // linkCallback notification is needed — issuing one too would double-apply
+        // the same inbound delta.
+        await syncFromPod(
             SOLID_POD_URL,
             SOLID_CONTAINER_PATH,
             authToken() || undefined,
         );
-
-        if (linkCallback && (diff.additions.length > 0 || diff.removals.length > 0)) {
-            linkCallback(diff);
-        }
     }
 }

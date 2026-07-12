@@ -170,6 +170,46 @@ describe("foldCommits: DAG is authoritative", () => {
         assert.ok(result.tombstoned.has(hashLinkContent(link, simpleHash)));
     });
 
+    it("a tombstone converges against its add even when the removal's proof is stripped", () => {
+        // The live-executor removal contract: perspective.removeLink hands the
+        // language a LinkExpression with an EMPTY proof — the original signature
+        // is NOT round-tripped into the removal diff. A peer replica folded the
+        // ADD with its real proof; the tombstone must still reference the SAME
+        // OR-Set key or the removal can never fold out. This models the exact C1
+        // failure: adds converged 20/20 but the removal froze because the
+        // tombstone (empty proof) and the folded add (real proof) hashed
+        // differently. The previous tombstone test reused one object for add and
+        // removal, so it never exercised this and passed while the live bug stood.
+        const added: LinkExpression = {
+            author: "did:key:z6MkTest",
+            timestamp: "2026-05-02T12:00:00.000Z",
+            data: { source: "channel://main", predicate: "flux://has_message", target: "expr://signed" },
+            proof: { signature: "210c5b60deadbeeffeed", key: "did:key:z6MkTest#z6MkTest" },
+        };
+        // What the executor actually passes to commit() for the removal.
+        const removedForm: LinkExpression = { ...added, proof: { signature: "", key: "" } };
+
+        assert.equal(
+            hashLinkContent(added, simpleHash),
+            hashLinkContent(removedForm, simpleHash),
+            "an add and its proof-stripped removal form must share the OR-Set key",
+        );
+
+        const add = commit({ additions: [added], removals: [] }, []);
+        const rm = commit({ additions: [], removals: [removedForm] }, [add.hash]);
+        const result = foldCommits(dagOf(add, rm), simpleHash);
+        assert.equal(result.links.size, 0, "the tombstone must fold the signed add out");
+    });
+
+    it("timestamp remains part of the identity key (it round-trips; proof does not)", () => {
+        // Sibling-consistent decision (nostr/ipfs key on s:p:t:author:timestamp):
+        // timestamp DOES survive removeLink, so two links differing only in
+        // timestamp are distinct OR-Set elements — only proof is excluded.
+        const t1 = makeLink("expr://ts");
+        const t2 = { ...makeLink("expr://ts"), timestamp: "2026-05-02T13:00:00.000Z" };
+        assert.notEqual(hashLinkContent(t1, simpleHash), hashLinkContent(t2, simpleHash));
+    });
+
     it("re-adding after a tombstone stays removed (observed-remove semantics)", () => {
         // Same logical link (identical hash) re-added after removal remains
         // tombstoned — the tombstone observed that exact hash.

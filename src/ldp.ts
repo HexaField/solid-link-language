@@ -274,12 +274,31 @@ export function deleteHeaders(authToken?: string): Record<string, string> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Join a pod base URL and a container path into a normalised container URL —
+ * exactly one `/` between them, exactly one trailing `/`, robust to either side
+ * carrying or omitting slashes.
+ *
+ * This MUST be the single join point for every pod URL. The templated values are
+ * not guaranteed to be slash-aligned: a pod URL can arrive as
+ * `http://host:3005` (no trailing slash) and a container path as `ad4m/<nh>/`
+ * (no leading slash). Naive concatenation then yields `http://host:3005ad4m/...`
+ * — an invalid URL that makes EVERY `httpFetch` throw `Invalid URL`, so no
+ * commit resource is ever written and no sync ever reads one. That is invisible
+ * to unit tests whose fixture container path happens to start with `/`, but it
+ * froze live C1 at A=10/B=10 (each agent seeing only its own locally-emitted
+ * links). Normalise here so slash alignment can never regress.
+ */
+export function joinPodPath(podUrl: string, containerPath: string): string {
+    const base = podUrl.replace(/\/+$/, "");
+    const path = containerPath.replace(/^\/+/, "").replace(/\/+$/, "");
+    return path ? `${base}/${path}/` : `${base}/`;
+}
+
+/**
  * Build the container URL for a neighbourhood's links.
  */
 export function linksContainerUrl(podUrl: string, containerPath: string): string {
-    const base = podUrl.replace(/\/$/, "");
-    const path = containerPath.replace(/\/$/, "");
-    return `${base}${path}/links/`;
+    return `${joinPodPath(podUrl, containerPath)}links/`;
 }
 
 /**
@@ -296,9 +315,7 @@ export function linkResourceUrl(containerUrl: string, linkHash: string): string 
  * container. Each immutable diff-commit is a resource `diffs/<hash>.ttl`.
  */
 export function diffsContainerUrl(podUrl: string, containerPath: string): string {
-    const base = podUrl.replace(/\/$/, "");
-    const path = containerPath.replace(/\/$/, "");
-    return `${base}${path}/diffs/`;
+    return `${joinPodPath(podUrl, containerPath)}diffs/`;
 }
 
 /**
@@ -321,9 +338,7 @@ export function diffResourceUrl(diffsContainer: string, commitHash: string): str
  * resources — see the language's native-ingest path).
  */
 export function viewsContainerUrl(podUrl: string, containerPath: string): string {
-    const base = podUrl.replace(/\/$/, "");
-    const path = containerPath.replace(/\/$/, "");
-    return `${base}${path}/views/`;
+    return `${joinPodPath(podUrl, containerPath)}views/`;
 }
 
 /**
@@ -357,18 +372,14 @@ export function extractCommitHash(resourceUrl: string): string | null {
  * Build the URL for the neighbourhood metadata resource.
  */
 export function metaResourceUrl(podUrl: string, containerPath: string): string {
-    const base = podUrl.replace(/\/$/, "");
-    const path = containerPath.replace(/\/$/, "");
-    return `${base}${path}/meta.ttl`;
+    return `${joinPodPath(podUrl, containerPath)}meta.ttl`;
 }
 
 /**
  * Build the URL for the members registry.
  */
 export function membersResourceUrl(podUrl: string, containerPath: string): string {
-    const base = podUrl.replace(/\/$/, "");
-    const path = containerPath.replace(/\/$/, "");
-    return `${base}${path}/members/index.ttl`;
+    return `${joinPodPath(podUrl, containerPath)}members/index.ttl`;
 }
 
 /**
