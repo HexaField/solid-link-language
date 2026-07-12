@@ -33,6 +33,21 @@ Invariants — do not break these:
   ancestors → re-fold). Do not reintroduce container-listing snapshot diffing or
   ETag change detection.
 
+## Channel-B projection (shared, verbatim)
+
+Beyond the diff-DAG, links also project into **native RDF resources** so Solid
+apps read them as first-class linked data. This rides the shared, protocol-
+agnostic SHACL→native transformer in `src/projection/`, **copied verbatim** across
+all Channel-B languages (matrix, nostr, atproto, solid, ap): `bridge.ts`,
+`expression.ts`, `index.ts`, `literal.ts`, `profile.ts`, `project.ts`,
+`types.ts`. **Do not edit it in isolation** — mirror any change to every Channel-B
+repo or the copies drift (asserted identical by diff). A `NodeShape` annotated
+`projection://nativeType` selects the projected property; `projection://field`
+marks projected properties. `src/solid-projection.ts` is the thin per-protocol
+`NativeAdapter`. The projection is a **pure fold of the DAG, never read back to
+rebuild it**; genuinely native-authored RDF from a user with **no AD4M DID** is
+echo-suppressed and ingested as new Role-A links.
+
 ## Layout
 
 - `src/diffdag.ts` — pure substrate: `hashLinkContent`, `commitHash`,
@@ -53,6 +68,8 @@ Invariants — do not break these:
   diff-DAG contract and intentionally not wired into the append-only commit
   path**; they are still tested by `tests/dual-language.test.ts` /
   `tests/sdna.test.ts`.
+- `src/solid-projection.ts` — the native-RDF `NativeAdapter` (Channel B).
+- `src/projection/` — the shared SHACL transformer (see above).
 - `src/{acl,auth,rdf,settings,types}.ts` — WAC, WebID-OIDC/CSS auth, Turtle
   primitives, settings, shared types.
 - `src/adapters.ts` / `src/adapters-deno.ts` — injected Transport / Storage /
@@ -75,7 +92,9 @@ The whole convergence path is unit-tested against in-memory fixtures
 Runtime, `tests/ldp.test.ts`, `tests/cross-runtime.test.ts`). What genuinely
 needs a **live Solid server** (e.g. Community Solid Server) and is NOT covered:
 real LDP container creation + `PUT`/`GET` round-trips, WebID-OIDC/CSS token
-auth, and Web Access Control.
+auth, and Web Access Control. The Channel-B projection is unit-tested for
+native-RDF payload shape + echo-suppressed ingest; live rendering in a Solid app
+against a running pod is not in CI.
 
 ## Gotchas
 
