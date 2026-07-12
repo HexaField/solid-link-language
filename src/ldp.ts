@@ -310,6 +310,41 @@ export function diffResourceUrl(diffsContainer: string, commitHash: string): str
 }
 
 /**
+ * Build the container URL for the human-facing Channel-B projection resources.
+ *
+ * These are the clean, app-legible RDF resources a Solid-native client (SolidOS,
+ * a generic LDP/RDF browser) reads — one per SHACL-projected subject instance.
+ * They live alongside `diffs/` (the Channel-A convergence DAG) in their own
+ * `views/` container so the projection never collides with the authoritative
+ * commit resources. This is the ONLY Channel-B pod state; it is derived from
+ * Role A and never read back as link truth (except for genuinely native-authored
+ * resources — see the language's native-ingest path).
+ */
+export function viewsContainerUrl(podUrl: string, containerPath: string): string {
+    const base = podUrl.replace(/\/$/, "");
+    const path = containerPath.replace(/\/$/, "");
+    return `${base}${path}/views/`;
+}
+
+/**
+ * Build the URL for a projection view resource, named by a slug derived from the
+ * instance's subject URI (its content hash). A given instance always maps to the
+ * same resource, so re-projecting overwrites in place rather than duplicating.
+ */
+export function viewResourceUrl(viewsContainer: string, slug: string): string {
+    return `${viewsContainer.replace(/\/$/, "")}/view-${slug}.ttl`;
+}
+
+/**
+ * Extract the view slug from a projection-resource URL.
+ * e.g. ".../views/view-Qm789.ttl" → "Qm789"
+ */
+export function extractViewSlug(resourceUrl: string): string | null {
+    const match = resourceUrl.match(/view-([^/.]+)\.ttl$/);
+    return match ? match[1] : null;
+}
+
+/**
  * Extract the commit hash from a diff-resource URL.
  * e.g. ".../diffs/diff-Qm789.ttl" → "Qm789"
  */

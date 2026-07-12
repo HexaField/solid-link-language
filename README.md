@@ -20,6 +20,14 @@ the source of truth; the RDF link view is a derived projection.
    link set, kept only for fast query/render. It is fully reconstructible from
    the DAG and is never authoritative.
 
+These map onto the two-channel architecture shared with the other AD4M link
+languages (Matrix, Nostr, Bluesky): **Channel A** is the authoritative
+convergence substrate above (the diff-DAG in `diffs/`); **Channel B** is a
+SHACL-driven projection of subject-class instances into the protocol's
+human-facing native content, written under `views/`. See
+[Role B — native projection](#role-b--native-projection-shacl-driven) below —
+for Solid this is a *near-identity* projection, which is the whole point.
+
 ## How convergence works
 
 - **`commit(diff)`** builds a diff-commit whose `ad4m:previous` are the current
@@ -41,6 +49,89 @@ the source of truth; the RDF link view is a derived projection.
   ETag: `null` when the DAG is empty, the single head's commit hash when there
   is one head, and a deterministic digest of the sorted head hashes when there
   are several. It is stable for a given DAG state and across restarts.
+
+## Role B — native projection (SHACL-driven)
+
+Channel A above federates the *whole* perspective as reified `ad4m:` diff-commit
+resources. That is perfect for convergence but opaque to a Solid-native client:
+SolidOS or a generic LDP/RDF browser pointed at `diffs/diff-<hash>.ttl` sees
+`ad4m:DiffCommit` / `ad4m:addition` / `ad4m:linkHash` machinery, not a legible
+"a message that says hello". **Role B (Channel B)** closes that gap: it renders
+each SHACL-annotated subject-class instance as a clean, human-facing RDF resource
+under `views/`, so a Solid-native app renders it directly.
+
+### Solid is the near-identity case (this is deliberate, not a shortcut)
+
+The other link languages translate a subject instance into a *foreign* content
+schema — Matrix into an `m.room.message`, Nostr into a kind-1 event, Bluesky into
+an `app.bsky.feed.post` record — because their native surface is a chat/post
+schema, not RDF. **Solid stores RDF, and an AD4M subject-class instance already
+IS RDF.** So Channel B here is a *near-identity* projection: it does not invent a
+non-RDF content schema; it re-expresses the same instance as direct
+subject-predicate-object triples that a Solid-native vocabulary consumer expects.
+
+Concretely, a Flux message that Channel A stores (reified) as
+
+```turtle
+<#add-Qm…> a ad4m:LinkExpression ;
+    rdf:subject <flux://msg1> ; rdf:predicate <sioc://content> ;
+    rdf:object "literal:string:Hello%20world" ; ad4m:author "did:key:alice" .
+```
+
+is projected by Channel B into the human-facing resource `views/view-<slug>.ttl`:
+
+```turtle
+<flux://msg1> a sioc:Post ;
+    sioc:content "Hello world" ;
+    dcterms:creator <did:key:alice> ;
+    dcterms:created "2026-07-12T10:00:00.000Z"^^xsd:dateTime .
+```
+
+The literal is decoded, the AD4M reification is gone, and the class + provenance
+are stated in vocabulary (`sioc:`, `dcterms:`) a Solid app reads. Which graph
+predicate carries each field is decided by the SHACL projection profile: a
+`projection://nativeType` annotation on a NodeShape makes the class projectable,
+and each projected property's `projection://field` names the **RDF predicate**
+the value rides (for Solid, `nativeField` *is* a predicate URI). Stock Flux
+projects with no SDNA annotations via a built-in default profile
+(`flux://body → sioc:content`, native type `sioc:Post`).
+
+### Wiring
+
+- **Outbound (`commit`).** After the authoritative diff-commit is published on
+  Channel A, `commit` folds the diff's additions through the SHACL profiles and
+  PUTs one `views/view-<slug>.ttl` per matched instance (slug = content hash of
+  the subject URI, so re-projecting overwrites in place). No `ad4m:` bytes enter
+  these resources; the projection is derived from Role A and never read back as
+  link truth.
+- **Inbound (`sync`).** Because native RDF is first-class on Solid, the reverse
+  path is *meaningful* here (unlike a plain-text protocol, where it only matters
+  for human-typed chat): a human or a non-AD4M Solid app may drop a genuinely
+  native RDF resource into `views/` with no backing commit. `sync` parses those,
+  maps them back to links via the same SHACL profile, and enters them into
+  Channel A as new authoritative links (a real commit). Resources produced by our
+  own projection are already present on Channel A and are skipped, so the loop is
+  idempotent and never double-ingests.
+
+### What Channel B actually adds for Solid
+
+Honest accounting, since Solid's substrate is already RDF:
+
+- **It is not redundant, but it is narrow.** Channel A already persists the full
+  graph as native RDF — but as *reified diff-commits*, which are convergence
+  plumbing, not app-legible resources. Channel B's contribution is exactly the
+  transform from that reified, hash-addressed envelope to a **flat,
+  vocabulary-native, human-facing resource** keyed on the instance's own subject
+  URI. That view is what makes the data usable by SolidOS and generic LDP tooling.
+- **The projection core is shared verbatim.** `src/projection/` is copied
+  unmodified from the reference (Matrix) language; only `src/solid-projection.ts`
+  (the `NativeAdapter<RdfResource>`) is Solid-specific, and it is a thin
+  RDF-resource ⇄ `Projection` mapping. This keeps Solid consistent with the other
+  languages' Channel-B contract at essentially zero divergence.
+- **No lossy foreign schema.** Because the mapping is near-identity, the outbound
+  projection loses nothing structural (only the `ad4m:` provenance reification,
+  which by design lives on Channel A) and the inbound ingest reconstructs the
+  instance's links exactly.
 
 ## Template Variables
 
@@ -83,6 +174,14 @@ live pod required:
   (`diffsContainerUrl`, `diffResourceUrl`, `extractCommitHash`) and header/URL
   helpers.
 - `tests/cross-runtime.test.ts` — revision derivation through the store.
+- `tests/projection.test.ts` — Channel B core: the literal codec, node-expression
+  evaluator, SHACL profile parsing, `project`/`ingest` round-trip, and the Solid
+  RDF adapter (`toNative` emits a clean `sioc:Post` resource with no `ad4m:`
+  reification; `fromNative` parses it back; typed literals / URI objects).
+- `tests/channel-b-bridge.test.ts` — Channel B orchestration over the Solid
+  adapter: `projectInstances` (graph → native RDF resources), `ingestNative`
+  (native resource → authoritative links, with container parenting), and the
+  default Flux → SIOC message profile.
 
 **Needs a live pod (not covered here):** real LDP container creation and
 `PUT`/`GET` round-trips against a running Solid server (e.g. Community Solid
@@ -98,10 +197,20 @@ Server), WebID-OIDC / CSS token authentication, and Web Access Control.
 - `src/sync.ts` — the pod-side DAG walk: discover commit resources, follow
   `ad4m:previous`, fetch missing ancestors, re-fold.
 - `src/ldp.ts` — LDP GET/HEAD/PUT/POST/PATCH/DELETE and the resource-URL
-  builders for the `diffs/` container and `diff-<hash>.ttl` resources.
+  builders for the `diffs/` container (`diff-<hash>.ttl`) and the Channel-B
+  `views/` container (`view-<slug>.ttl`).
 - `src/ontology.ts` — the AD4M diff-DAG ontology terms in RDF (`ad4m:DiffCommit`,
   `ad4m:previous`, `ad4m:addition`, `ad4m:removal`, `ad4m:Tombstone`, …).
 - `src/rdf.ts` — Turtle parsing/serialization primitives.
+- `src/projection/` — the shared, protocol-agnostic Channel-B core, copied
+  **verbatim** from the reference (Matrix) language: literal codec, node-expression
+  evaluator, SHACL profile parsing, and the `project`/`ingest`/`projectInstances`/
+  `ingestNative` fold. Not modified per-language.
+- `src/solid-projection.ts` — the Solid-specific `NativeAdapter<RdfResource>`:
+  the only Channel-B code that knows Solid's native shape. `toNative` renders a
+  `Projection` as a flat, vocabulary-native RDF resource (subject + direct
+  predicate/object triples, `dcterms:` provenance); `fromNative` parses one back.
+  The near-identity mapping that distinguishes Solid from the plain-text protocols.
 - `src/translate.ts` — link ↔ RDF translation, plus the retained dual-language
   and SDNA-pattern helpers (exercised by `tests/dual-language.test.ts` and
   `tests/sdna.test.ts`). These are orthogonal to the diff-DAG contract and are
