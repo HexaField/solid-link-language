@@ -290,6 +290,35 @@ export function linkResourceUrl(containerUrl: string, linkHash: string): string 
 }
 
 /**
+ * Build the container URL for a neighbourhood's diff-commit DAG.
+ *
+ * The diff-DAG (convergence substrate) lives alongside `links/` in its own
+ * container. Each immutable diff-commit is a resource `diffs/<hash>.ttl`.
+ */
+export function diffsContainerUrl(podUrl: string, containerPath: string): string {
+    const base = podUrl.replace(/\/$/, "");
+    const path = containerPath.replace(/\/$/, "");
+    return `${base}${path}/diffs/`;
+}
+
+/**
+ * Build the URL for a diff-commit resource, named by its content hash.
+ * Immutable: a given hash always maps to the same body.
+ */
+export function diffResourceUrl(diffsContainer: string, commitHash: string): string {
+    return `${diffsContainer.replace(/\/$/, "")}/diff-${commitHash}.ttl`;
+}
+
+/**
+ * Extract the commit hash from a diff-resource URL.
+ * e.g. ".../diffs/diff-Qm789.ttl" → "Qm789"
+ */
+export function extractCommitHash(resourceUrl: string): string | null {
+    const match = resourceUrl.match(/diff-([^/.]+)\.ttl$/);
+    return match ? match[1] : null;
+}
+
+/**
  * Build the URL for the neighbourhood metadata resource.
  */
 export function metaResourceUrl(podUrl: string, containerPath: string): string {
