@@ -35,6 +35,22 @@ export const ad4m = {
     linkLanguageHash: `${AD4M_NS}linkLanguageHash`,
     sdnaPattern: `${AD4M_NS}sdnaPattern`,
     hasDID: `${AD4M_NS}hasDID`,
+
+    // --- diff-DAG (convergence substrate) ---
+    /** rdf:type of a diff-commit node in the emulated DAG. */
+    DiffCommit: `${AD4M_NS}DiffCommit`,
+    /** Parent pointer(s): a commit's `ad4m:previous` triples form the causal DAG. */
+    previous: `${AD4M_NS}previous`,
+    /** Links added by a commit (object = the reified addition node). */
+    addition: `${AD4M_NS}addition`,
+    /** First-class removals: object = a tombstone node carrying the original link hash. */
+    removal: `${AD4M_NS}removal`,
+    /** rdf:type of a tombstone node. */
+    Tombstone: `${AD4M_NS}Tombstone`,
+    /** The content hash of the link a tombstone removes (matches the original add). */
+    removesLinkHash: `${AD4M_NS}removesLinkHash`,
+    /** Convenience: the content hash of an addition's link (for OR-Set keying). */
+    linkHash: `${AD4M_NS}linkHash`,
 } as const;
 
 export const rdf = {
