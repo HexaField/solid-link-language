@@ -199,9 +199,32 @@ live pod required:
   (native resource → authoritative links, with container parenting), and the
   default Flux → SIOC message profile.
 
-**Needs a live pod (not covered here):** real LDP container creation and
-`PUT`/`GET` round-trips against a running Solid server (e.g. Community Solid
-Server), WebID-OIDC / CSS token authentication, and Web Access Control.
+**Not covered by the unit suite:** WebID-OIDC / CSS token authentication and Web
+Access Control. Live LDP container creation and `PUT`/`GET` round-trips against a
+running Community Solid Server *are* exercised by the co-located C1 run below.
+
+### Verified live against a real pod (co-located C1)
+
+Beyond the unit fixtures, this language has been run **end-to-end against a live
+Community Solid Server 7.1.9** (in-memory storage, allow-all authorization) in the
+wind-tunnel `c1-convergence` scenario: two AD4M executors `PUT`/`GET` diff-commit
+resources into one shared pod container. Both agents reached **20/20 links in
+1.0 s** and a removal converged in **3.0 s**.
+
+That run earned its keep — it surfaced **three defects invisible to the 282
+passing unit tests**, each dependent on live two-agent semantics against a real
+pod: (1) the executor **discarding `sync()`'s return value** — the fold walked the
+pod's `ad4m:previous` DAG and updated the local store but returned the delta
+instead of pushing it, so peer links never became queryable and each replica froze
+at its own 10 links; fixed by routing the fold delta through `emitPerspectiveDiff`;
+(2) a **URL-join bug** gluing a no-trailing-slash pod URL to a no-leading-slash
+container path into an invalid `…3005ad4m/…` that threw on every fetch, now
+normalised through a `joinPodPath` helper; and (3) an **OR-Set identity-key bug** —
+the link hash keyed on `proof`, but AD4M hands the language an empty-proof
+tombstone, so a removal could never reference the signed add a peer had folded;
+fixed by dropping `proof` from the key. Regression tests for all three lock the
+behaviour (the emit-contract, slash-normalisation, and proof-stripped tombstone
+tests above).
 
 ## Module map
 
