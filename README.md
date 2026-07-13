@@ -226,6 +226,24 @@ fixed by dropping `proof` from the key. Regression tests for all three lock the
 behaviour (the emit-contract, slash-normalisation, and proof-stripped tombstone
 tests above).
 
+### Role B — verified live in a Solid-native RDF reader
+
+The run above proves Channel-A convergence. Channel B was **separately verified
+end-to-end** against the same live CSS 7.1.9: this language's own projection path
+`PUT` a `views/view-<slug>.ttl`, and **three independent RDF stacks** — `rdflib`,
+`N3.js`, and a SPARQL parse — each read it back as a clean `sioc:Post`
+(`sioc:content "Hello world"`, `dcterms:creator`, `dcterms:created`) with **zero
+`ad4m:` triples**. The reverse path was exercised too: a hand-authored native RDF
+resource dropped into `views/` with no backing commit was parsed back into a new
+authoritative link on Channel A.
+
+Both honesty checks hold: **(1) the projection is real** — legible
+vocabulary-native RDF a Solid app reads directly, not `ad4m:DiffCommit`
+machinery; **(2) it is live** — this language's path wrote it and native RDF
+readers rendered it. Caveat: the pod ran **allow-all authorization**, so
+WebID-OIDC / Web Access Control gating of the `views/` container is not part of
+this run (as noted above for Channel A).
+
 ## Module map
 
 - `src/diffdag.ts` — the convergence substrate: link/commit content hashing,
